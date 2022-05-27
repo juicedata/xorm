@@ -4,10 +4,28 @@
 
 package xorm
 
+import "database/sql"
+
 // Begin a transaction
 func (session *Session) Begin() error {
 	if session.isAutoCommit {
 		tx, err := session.DB().BeginTx(session.ctx, nil)
+		if err != nil {
+			return err
+		}
+		session.isAutoCommit = false
+		session.isCommitedOrRollbacked = false
+		session.tx = tx
+
+		session.saveLastSQL("BEGIN TRANSACTION")
+	}
+	return nil
+}
+
+// Begin a transaction with additional options
+func (session *Session) BeginTx(opt *sql.TxOptions) error {
+	if session.isAutoCommit {
+		tx, err := session.DB().BeginTx(session.ctx, opt)
 		if err != nil {
 			return err
 		}
