@@ -1419,11 +1419,15 @@ func (engine *Engine) PingContext(ctx context.Context) error {
 }
 
 // Transaction Execute sql wrapped in a transaction(abbr as tx), tx will automatic commit if no errors occurred
-func (engine *Engine) Transaction(f func(*Session) (any, error)) (any, error) {
+func (engine *Engine) Transaction(f func(*Session) (any, error), opts ...*sql.TxOptions) (any, error) {
 	session := engine.NewSession()
 	defer session.Close()
 
-	if err := session.Begin(); err != nil {
+	var opt *sql.TxOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if err := session.BeginTx(opt); err != nil {
 		return nil, err
 	}
 
