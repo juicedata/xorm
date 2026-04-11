@@ -6,6 +6,7 @@ package statements
 
 import (
 	"database/sql/driver"
+	"encoding/json"
 	"fmt"
 
 	"xorm.io/builder"
@@ -20,6 +21,14 @@ type DateTimeString struct {
 // Value implements the driver Valuer interface.
 func (n DateTimeString) Value() (driver.Value, error) {
 	return n.Str, nil
+}
+
+func (d DateTimeString) MarshalText() (text []byte, err error) {
+	return []byte(d.Str), nil
+}
+
+func (n DateTimeString) MarshalJSON() ([]byte, error) {
+	return json.Marshal(n.Str)
 }
 
 // WriteArg writes an arg
