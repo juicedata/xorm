@@ -15,6 +15,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
+      - name: wait for mysql8 service
+        run: |
+          for i in $(seq 1 15); do
+            (echo > /dev/tcp/mysql8/3306) &>/dev/null && echo "MySQL is ready!" && break
+            echo "Waiting for MySQL... ($i/15)"
+            [ $i -eq 15 ] && echo "MySQL failed to start in time!" && exit 1
+            sleep 1
+          done
       - name: test mysql8
         env:
           TEST_MYSQL_HOST: mysql8
