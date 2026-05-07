@@ -64,6 +64,7 @@ func (h *Hooks) BeforeProcess(c *ContextHook) (context.Context, error) {
 		if err != nil {
 			return nil, err
 		}
+		c.Ctx = ctx
 	}
 	return ctx, nil
 }
