@@ -1092,17 +1092,19 @@ func (db *postgres) IsColumnExist(queryer core.Queryer, ctx context.Context, tab
 func (db *postgres) GetColumns(queryer core.Queryer, ctx context.Context, tableName string) ([]string, map[string]*schemas.Column, error) {
 	args := []any{tableName}
 	s := `SELECT column_name, column_default, is_nullable, data_type, character_maximum_length, description,
-    CASE WHEN p.contype = 'p' THEN true ELSE false END AS primarykey,
-    CASE WHEN p.contype = 'u' THEN true ELSE false END AS uniquekey
-FROM pg_attribute f
+    COALESCE(bool_or(p.contype = 'p'), false) AS primarykey,
+    COALESCE(bool_or(p.contype = 'u'), false) AS uniquekey
+	FROM pg_attribute f
     JOIN pg_class c ON c.oid = f.attrelid JOIN pg_type t ON t.oid = f.atttypid
     LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = f.attnum
     LEFT JOIN pg_description de ON f.attrelid=de.objoid AND f.attnum=de.objsubid
     LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
     LEFT JOIN pg_constraint p ON p.conrelid = c.oid AND f.attnum = ANY (p.conkey)
     LEFT JOIN pg_class AS g ON p.confrelid = g.oid
-    LEFT JOIN INFORMATION_SCHEMA.COLUMNS s ON s.column_name=f.attname AND c.relname=s.table_name
-WHERE n.nspname= s.table_schema AND c.relkind = 'r' AND c.relname = $1%s AND f.attnum > 0 ORDER BY f.attnum;`
+    LEFT JOIN INFORMATION_SCHEMA.COLUMNS s ON s.column_name=f.attname AND c.relname=s.table_name AND n.nspname = s.table_schema
+	WHERE n.nspname = s.table_schema AND c.relkind = 'r' AND c.relname = $1%s AND f.attnum > 0
+	GROUP BY s.column_name, s.column_default, s.is_nullable, s.data_type, s.character_maximum_length, de.description, f.attnum
+	ORDER BY f.attnum;`
 
 	schema := db.getSchema()
 	if schema != "" {
