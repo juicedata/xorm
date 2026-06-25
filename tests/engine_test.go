@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,6 +136,43 @@ func TestDump(t *testing.T) {
 			assert.NoError(t, testEngine.DumpAllToFile(name, tp))
 		})
 	}
+}
+
+func TestDumpSQLiteLargeText(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.SQLITE {
+		t.Skip("sqlite only")
+	}
+
+	type TestDumpLargeText struct {
+		Id   int64
+		Body string
+	}
+
+	assertSync(t, new(TestDumpLargeText))
+
+	largeText := strings.Repeat("line\n", 1200)
+	_, err := testEngine.Insert(&TestDumpLargeText{Body: largeText})
+	assert.NoError(t, err)
+
+	fp := "sqlite_dump_large_text.sql"
+	os.Remove(fp)
+	assert.NoError(t, testEngine.DumpAllToFile(fp))
+
+	assert.NoError(t, PrepareEngine())
+
+	sess := testEngine.NewSession()
+	defer sess.Close()
+	assert.NoError(t, sess.Begin())
+	_, err = sess.ImportFile(fp)
+	assert.NoError(t, err)
+	assert.NoError(t, sess.Commit())
+
+	var got TestDumpLargeText
+	has, err := testEngine.Get(&got)
+	assert.NoError(t, err)
+	assert.True(t, has)
+	assert.Equal(t, largeText, got.Body)
 }
 
 var dbtypes = []schemas.DBType{schemas.SQLITE, schemas.MYSQL, schemas.POSTGRES, schemas.MSSQL}

@@ -503,6 +503,26 @@ func writeConcatWithChar(w io.Writer, value string) error {
 	return nil
 }
 
+func writeSQLiteUniStr(w io.Writer, value string) error {
+	var builder strings.Builder
+	builder.WriteString("unistr('")
+	for _, r := range value {
+		switch {
+		case r == '\'':
+			builder.WriteString("''")
+		case r == '\\':
+			builder.WriteString("\\\\")
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&builder, "\\u%04x", r)
+		default:
+			builder.WriteRune(r)
+		}
+	}
+	builder.WriteString("')")
+	_, err := io.WriteString(w, builder.String())
+	return err
+}
+
 // dumpTables dump database all table structs and data to w with specify db type
 func (engine *Engine) dumpTables(ctx context.Context, tables []*schemas.Table, w io.Writer, tp ...schemas.DBType) error {
 	var dstDialect dialects.Dialect
@@ -727,29 +747,13 @@ func (engine *Engine) dumpTables(ctx context.Context, tables []*schemas.Table, w
 								return err
 							}
 						} else {
-							// SQLite concatentates strings using || (NOTE: a NUL byte in a text segment will fail)
-							toCheck := strings.ReplaceAll(s.String, "'", "''")
-							for len(toCheck) > 0 {
-								loc := controlCharactersRe.FindStringIndex(toCheck)
-								if loc == nil {
-									if _, err := io.WriteString(w, "'"+toCheck+"'"); err != nil {
-										return err
-									}
-									break
-								}
-								if loc[0] > 0 {
-									if _, err := io.WriteString(w, "'"+toCheck[:loc[0]]+"' || "); err != nil {
-										return err
-									}
-								}
-								if _, err := fmt.Fprintf(w, "X'%x'", toCheck[loc[0]:loc[1]]); err != nil {
+							if controlCharactersRe.MatchString(s.String) {
+								if err := writeSQLiteUniStr(w, s.String); err != nil {
 									return err
 								}
-								toCheck = toCheck[loc[1]:]
-								if len(toCheck) > 0 {
-									if _, err := io.WriteString(w, " || "); err != nil {
-										return err
-									}
+							} else {
+								if _, err := io.WriteString(w, "'"+strings.ReplaceAll(s.String, "'", "''")+"'"); err != nil {
+									return err
 								}
 							}
 						}

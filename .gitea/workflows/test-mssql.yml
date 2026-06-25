@@ -15,6 +15,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
+      - name: wait for mssql
+        run: |
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/mssql/1433) >/dev/null 2>&1; then
+              # SQL Server can accept TCP before it is fully ready for queries.
+              sleep 15
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "mssql did not become ready in time"
+          exit 1
       - name: test mssql
         env:
           TEST_MSSQL_HOST: mssql
