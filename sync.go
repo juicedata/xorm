@@ -5,11 +5,83 @@
 package xorm
 
 import (
+	"math/big"
 	"strings"
 
 	"xorm.io/xorm/internal/utils"
 	"xorm.io/xorm/schemas"
 )
+
+func columnDefaultsMatch(col, oriCol *schemas.Column) bool {
+	switch {
+	case col.IsAutoIncrement:
+		return true
+	case col.DefaultIsEmpty && oriCol.DefaultIsEmpty:
+		return true
+	case col.DefaultIsEmpty:
+		return nullableNullDefault(col, oriCol)
+	case oriCol.DefaultIsEmpty:
+		return nullableNullDefault(oriCol, col)
+	}
+
+	return normalizeColumnDefaultValue(col.SQLType, col.Default) ==
+		normalizeColumnDefaultValue(col.SQLType, oriCol.Default)
+}
+
+func nullableNullDefault(emptyDefaultCol, explicitDefaultCol *schemas.Column) bool {
+	if !emptyDefaultCol.Nullable || !explicitDefaultCol.Nullable {
+		return false
+	}
+
+	return strings.EqualFold(strings.TrimSpace(explicitDefaultCol.Default), "NULL")
+}
+
+func normalizeColumnDefaultValue(sqlType schemas.SQLType, defaultValue string) string {
+	normalized := strings.TrimSpace(defaultValue)
+	if normalized == "" {
+		return normalized
+	}
+
+	if sqlType.IsBool() {
+		switch strings.ToLower(trimDefaultQuotes(normalized)) {
+		case "1", "true":
+			return "true"
+		case "0", "false":
+			return "false"
+		}
+	}
+
+	if sqlType.IsNumeric() {
+		if numeric, ok := normalizeNumericDefaultValue(normalized); ok {
+			return numeric
+		}
+	}
+
+	return normalized
+}
+
+func normalizeNumericDefaultValue(defaultValue string) (string, bool) {
+	normalized := trimDefaultQuotes(defaultValue)
+	rat, ok := new(big.Rat).SetString(normalized)
+	if !ok {
+		return "", false
+	}
+
+	return rat.RatString(), true
+}
+
+func trimDefaultQuotes(defaultValue string) string {
+	if len(defaultValue) < 2 {
+		return defaultValue
+	}
+
+	if (defaultValue[0] == '\'' && defaultValue[len(defaultValue)-1] == '\'') ||
+		(defaultValue[0] == '"' && defaultValue[len(defaultValue)-1] == '"') {
+		return defaultValue[1 : len(defaultValue)-1]
+	}
+
+	return defaultValue
+}
 
 type SyncOptions struct {
 	WarnIfDatabaseColumnMissed bool
@@ -205,16 +277,9 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 				}
 			}
 
-			if col.Default != oriCol.Default {
-				switch {
-				case col.IsAutoIncrement: // For autoincrement column, don't check default
-				case (col.SQLType.Name == schemas.Bool || col.SQLType.Name == schemas.Boolean) &&
-					((strings.EqualFold(col.Default, "true") && oriCol.Default == "1") ||
-						(strings.EqualFold(col.Default, "false") && oriCol.Default == "0")):
-				default:
-					engine.logger.Warnf("Table %s Column %s db default is %s, struct default is %s",
-						tbName, col.Name, oriCol.Default, col.Default)
-				}
+			if !columnDefaultsMatch(col, oriCol) {
+				engine.logger.Warnf("Table %s Column %s db default is %s, struct default is %s",
+					tbName, col.Name, oriCol.Default, col.Default)
 			}
 			if col.Nullable != oriCol.Nullable {
 				engine.logger.Warnf("Table %s Column %s db nullable is %v, struct nullable is %v",
