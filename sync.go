@@ -12,6 +12,15 @@ import (
 	"xorm.io/xorm/schemas"
 )
 
+var displayWidthNumericTypes = map[string]struct{}{
+	schemas.BigInt:    {},
+	schemas.Int:       {},
+	schemas.Integer:   {},
+	schemas.MediumInt: {},
+	schemas.SmallInt:  {},
+	schemas.TinyInt:   {},
+}
+
 func columnDefaultsMatch(col, oriCol *schemas.Column) bool {
 	switch {
 	case col.IsAutoIncrement:
@@ -81,6 +90,80 @@ func trimDefaultQuotes(defaultValue string) string {
 	}
 
 	return defaultValue
+}
+
+func normalizeColumnTypeForComparison(alias func(string) string, columnType string) string {
+	normalized := strings.ToUpper(strings.TrimSpace(columnType))
+	if normalized == "" {
+		return normalized
+	}
+
+	unsignedSuffix := ""
+	if strings.HasSuffix(normalized, " UNSIGNED") {
+		unsignedSuffix = " UNSIGNED"
+		normalized = strings.TrimSpace(strings.TrimSuffix(normalized, unsignedSuffix))
+	}
+
+	baseType := strings.ToUpper(strings.TrimSpace(schemas.SQLTypeName(normalized)))
+	typeSuffix := strings.TrimPrefix(normalized, baseType)
+	if _, ok := displayWidthNumericTypes[baseType]; ok {
+		normalized = baseType
+	} else {
+		normalized = baseType + typeSuffix
+	}
+
+	if alias != nil {
+		aliasedBaseType := strings.ToUpper(alias(baseType))
+		if _, ok := displayWidthNumericTypes[baseType]; ok {
+			normalized = aliasedBaseType
+		} else {
+			normalized = aliasedBaseType + typeSuffix
+		}
+	}
+
+	if unsignedSuffix != "" && !strings.HasSuffix(normalized, unsignedSuffix) {
+		normalized += unsignedSuffix
+	}
+
+	return normalized
+}
+
+func columnUsesCompatibleJSONType(col *schemas.Column, currentType string) bool {
+	if col == nil {
+		return false
+	}
+
+	currentBaseType := strings.ToUpper(strings.TrimSpace(schemas.SQLTypeName(currentType)))
+	switch {
+	case col.IsJSONB:
+		return currentBaseType == schemas.Jsonb
+	case col.IsJSON:
+		return currentBaseType == schemas.Json
+	default:
+		return false
+	}
+}
+
+func columnTypesMatch(alias func(string) string, expectedCol, currentCol *schemas.Column, expectedType, currentType string) bool {
+	if alias == nil {
+		alias = func(columnType string) string {
+			return columnType
+		}
+	}
+
+	if expectedType == currentType {
+		return true
+	}
+
+	if columnUsesCompatibleJSONType(expectedCol, currentType) || columnUsesCompatibleJSONType(currentCol, expectedType) {
+		return true
+	}
+
+	if normalizeColumnTypeForComparison(alias, expectedType) == normalizeColumnTypeForComparison(alias, currentType) {
+		return true
+	}
+
+	return strings.EqualFold(schemas.SQLTypeName(currentType), alias(schemas.SQLTypeName(expectedType)))
 }
 
 type SyncOptions struct {
@@ -230,7 +313,7 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 			expectedType := engine.dialect.SQLType(col)
 			curType := engine.dialect.SQLType(oriCol)
 			switch {
-			case expectedType != curType:
+			case !columnTypesMatch(engine.dialect.Alias, col, oriCol, expectedType, curType):
 				switch {
 				case expectedType == schemas.Text && strings.HasPrefix(curType, schemas.Varchar):
 					// currently only support mysql & postgres
@@ -254,7 +337,7 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 					}
 				default:
 					if !(strings.HasPrefix(curType, expectedType) && curType[len(expectedType)] == '(') {
-						if !strings.EqualFold(schemas.SQLTypeName(curType), engine.dialect.Alias(schemas.SQLTypeName(expectedType))) {
+						if !columnTypesMatch(engine.dialect.Alias, col, oriCol, expectedType, curType) {
 							engine.logger.Warnf("Table %s column %s db type is %s, struct type is %s",
 								tbNameWithSchema, col.Name, curType, expectedType)
 						}

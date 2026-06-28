@@ -5,8 +5,14 @@
 package xorm
 
 import (
+	"bytes"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	_ "github.com/mattn/go-sqlite3"
+
+	"xorm.io/xorm/log"
 	"xorm.io/xorm/schemas"
 )
 
@@ -211,5 +217,198 @@ func TestNormalizeColumnDefaultValue(t *testing.T) {
 				t.Fatalf("normalizeColumnDefaultValue() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeColumnTypeForComparison(t *testing.T) {
+	alias := func(columnType string) string {
+		if columnType == "NUMERIC" {
+			return "DECIMAL"
+		}
+		return columnType
+	}
+
+	tests := []struct {
+		name       string
+		columnType string
+		want       string
+	}{
+		{
+			name:       "mysql integer display width is ignored",
+			columnType: "INT(10) UNSIGNED",
+			want:       "INT UNSIGNED",
+		},
+		{
+			name:       "signed integer keeps base type only",
+			columnType: "BIGINT(20)",
+			want:       "BIGINT",
+		},
+		{
+			name:       "alias still applies after normalization",
+			columnType: "NUMERIC(10,2)",
+			want:       "DECIMAL(10,2)",
+		},
+		{
+			name:       "non integer length stays significant",
+			columnType: "VARCHAR(255)",
+			want:       "VARCHAR(255)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeColumnTypeForComparison(alias, tt.columnType); got != tt.want {
+				t.Fatalf("normalizeColumnTypeForComparison() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestColumnTypesMatch(t *testing.T) {
+	alias := func(columnType string) string {
+		if columnType == "NUMERIC" {
+			return "DECIMAL"
+		}
+		return columnType
+	}
+
+	tests := []struct {
+		name         string
+		expectedCol  *schemas.Column
+		currentCol   *schemas.Column
+		expectedType string
+		currentType  string
+		want         bool
+	}{
+		{
+			name:         "mysql unsigned display width warning is suppressed",
+			expectedCol:  &schemas.Column{},
+			currentCol:   &schemas.Column{},
+			expectedType: "INT UNSIGNED",
+			currentType:  "INT(10) UNSIGNED",
+			want:         true,
+		},
+		{
+			name:         "mysql signedness mismatch still warns",
+			expectedCol:  &schemas.Column{},
+			currentCol:   &schemas.Column{},
+			expectedType: "INT UNSIGNED",
+			currentType:  "INT(10)",
+			want:         false,
+		},
+		{
+			name:         "type aliases still match",
+			expectedCol:  &schemas.Column{},
+			currentCol:   &schemas.Column{},
+			expectedType: "DECIMAL(10,2)",
+			currentType:  "NUMERIC(10,2)",
+			want:         true,
+		},
+		{
+			name: "json-tagged text matches native json column",
+			expectedCol: &schemas.Column{
+				IsJSON: true,
+			},
+			currentCol:   &schemas.Column{},
+			expectedType: "TEXT",
+			currentType:  "JSON",
+			want:         true,
+		},
+		{
+			name: "jsonb-tagged text matches native jsonb column",
+			expectedCol: &schemas.Column{
+				IsJSON:  true,
+				IsJSONB: true,
+			},
+			currentCol:   &schemas.Column{},
+			expectedType: "TEXT",
+			currentType:  "JSONB",
+			want:         true,
+		},
+		{
+			name:         "plain text still differs from native json column",
+			expectedCol:  &schemas.Column{},
+			currentCol:   &schemas.Column{},
+			expectedType: "TEXT",
+			currentType:  "JSON",
+			want:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := columnTypesMatch(alias, tt.expectedCol, tt.currentCol, tt.expectedType, tt.currentType); got != tt.want {
+				t.Fatalf("columnTypesMatch() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+type syncWarnMissingColumnInitial struct {
+	ID        int64
+	LegacyCol string
+}
+
+func (syncWarnMissingColumnInitial) TableName() string {
+	return "sync_warn_missing_column"
+}
+
+type syncWarnMissingColumnCurrent struct {
+	ID int64
+}
+
+func (syncWarnMissingColumnCurrent) TableName() string {
+	return "sync_warn_missing_column"
+}
+
+func TestSyncWithWarnIfDatabaseColumnMissed(t *testing.T) {
+	engine, err := NewEngine("sqlite3", filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	defer engine.Close()
+
+	assertNoError := func(err error) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	assertNoError(engine.Sync(new(syncWarnMissingColumnInitial)))
+
+	var buf bytes.Buffer
+	logger := log.NewSimpleLogger3(&buf, "", 0, log.LOG_WARNING)
+	engine.SetLogger(logger)
+
+	_, err = engine.SyncWithOptions(SyncOptions{WarnIfDatabaseColumnMissed: true}, new(syncWarnMissingColumnCurrent))
+	assertNoError(err)
+
+	if !strings.Contains(buf.String(), "Table sync_warn_missing_column has column legacy_col but struct has not related field") {
+		t.Fatalf("expected missing-column warning, got %q", buf.String())
+	}
+}
+
+func TestSyncWithoutWarnIfDatabaseColumnMissed(t *testing.T) {
+	engine, err := NewEngine("sqlite3", filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	defer engine.Close()
+
+	if err = engine.Sync(new(syncWarnMissingColumnInitial)); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+
+	var buf bytes.Buffer
+	logger := log.NewSimpleLogger3(&buf, "", 0, log.LOG_WARNING)
+	engine.SetLogger(logger)
+
+	_, err = engine.SyncWithOptions(SyncOptions{}, new(syncWarnMissingColumnCurrent))
+	if err != nil {
+		t.Fatalf("SyncWithOptions() error = %v", err)
+	}
+
+	if strings.Contains(buf.String(), "struct has not related field") {
+		t.Fatalf("unexpected missing-column warning, got %q", buf.String())
 	}
 }
