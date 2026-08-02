@@ -178,6 +178,57 @@ type SyncOptions struct {
 
 type SyncResult struct{}
 
+func shouldSyncColumn(col *schemas.Column) bool {
+	return col.MapType != schemas.ONLYFROMDB
+}
+
+func schemaTableForSync(table *schemas.Table) *schemas.Table {
+	filtered := schemas.NewTable(table.Name, table.Type)
+	filtered.StoreEngine = table.StoreEngine
+	filtered.Charset = table.Charset
+	filtered.Comment = table.Comment
+	filtered.Collation = table.Collation
+
+	includedColumns := make(map[string]struct{}, len(table.Columns()))
+	for _, col := range table.Columns() {
+		if !shouldSyncColumn(col) {
+			continue
+		}
+
+		clone := *col
+		clone.FieldIndex = append([]int(nil), col.FieldIndex...)
+		clone.Indexes = make(map[string]int, len(col.Indexes))
+		for name, idxType := range col.Indexes {
+			clone.Indexes[name] = idxType
+		}
+
+		filtered.AddColumn(&clone)
+		includedColumns[strings.ToLower(col.Name)] = struct{}{}
+	}
+
+	for _, index := range table.Indexes {
+		keep := true
+		for _, colName := range index.Cols {
+			if _, ok := includedColumns[strings.ToLower(colName)]; !ok {
+				keep = false
+				break
+			}
+		}
+		if !keep {
+			continue
+		}
+
+		filtered.AddIndex(&schemas.Index{
+			IsRegular: index.IsRegular,
+			Name:      index.Name,
+			Type:      index.Type,
+			Cols:      append([]string(nil), index.Cols...),
+		})
+	}
+
+	return filtered
+}
+
 // Sync the new struct changes to database, this method will automatically add
 // table, column, index, unique. but will not delete or change anything.
 // If you change some field, you should change the database manually.
@@ -244,6 +295,7 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 		if err != nil {
 			return nil, err
 		}
+		syncTable := schemaTableForSync(table)
 		var tbName string
 		if len(session.statement.AltTableName) > 0 {
 			tbName = session.statement.AltTableName
@@ -262,20 +314,25 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 
 		// this is a new table
 		if oriTable == nil {
-			err = session.StoreEngine(session.statement.StoreEngine).createTable(bean)
+			syncTable.StoreEngine = session.statement.StoreEngine
+			syncTable.Charset = session.statement.Charset
+			session.statement.RefTable = syncTable
+			session.statement.SetTableName(tbNameWithSchema)
+
+			err = session.createCurrentTable()
 			if err != nil {
 				return nil, err
 			}
 
 			if !opts.IgnoreConstrains {
-				err = session.createUniques(bean)
+				err = session.createCurrentUniques()
 				if err != nil {
 					return nil, err
 				}
 			}
 
 			if !opts.IgnoreIndices {
-				err = session.createIndexes(bean)
+				err = session.createCurrentIndexes()
 				if err != nil {
 					return nil, err
 				}
@@ -290,7 +347,7 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 		}
 
 		// check columns
-		for _, col := range table.Columns() {
+		for _, col := range syncTable.Columns() {
 			var oriCol *schemas.Column
 			for _, col2 := range oriTable.Columns() {
 				if strings.EqualFold(col.Name, col2.Name) {
@@ -301,7 +358,7 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 
 			// column is not exist on table
 			if oriCol == nil {
-				session.statement.RefTable = table
+				session.statement.RefTable = syncTable
 				session.statement.SetTableName(tbNameWithSchema)
 				if err = session.addColumn(col.Name); err != nil {
 					return nil, err
@@ -380,7 +437,7 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 		addedNames := make(map[string]*schemas.Index)
 
 		// drop indices that exist in orig and new table schema but are not equal
-		for name, index := range table.Indexes {
+		for name, index := range syncTable.Indexes {
 			var oriIndex *schemas.Index
 			for name2, index2 := range oriTable.Indexes {
 				if index.Equal(index2) {
@@ -417,11 +474,11 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 		// Add new indices because either they did not exist before or were dropped to update them
 		for name, index := range addedNames {
 			if index.Type == schemas.UniqueType && !opts.IgnoreConstrains {
-				session.statement.RefTable = table
+				session.statement.RefTable = syncTable
 				session.statement.SetTableName(tbNameWithSchema)
 				err = session.addUnique(tbNameWithSchema, name)
 			} else if index.Type == schemas.IndexType && !opts.IgnoreIndices {
-				session.statement.RefTable = table
+				session.statement.RefTable = syncTable
 				session.statement.SetTableName(tbNameWithSchema)
 				err = session.addIndex(tbNameWithSchema, name)
 			}

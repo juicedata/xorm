@@ -1119,6 +1119,18 @@ func TestTagsDirection(t *testing.T) {
 	}
 
 	assertSync(t, new(OnlyFromDBStruct))
+	_, err := testEngine.Exec(testEngine.Dialect().AddColumnSQL(
+		testEngine.TableName(new(OnlyFromDBStruct)),
+		&schemas.Column{
+			Name:           "uuid",
+			SQLType:        schemas.SQLType{Name: schemas.Varchar},
+			Length:         255,
+			Nullable:       true,
+			Default:        "'1'",
+			DefaultIsEmpty: false,
+		},
+	))
+	assert.NoError(t, err)
 
 	cnt, err := testEngine.Insert(&OnlyFromDBStruct{
 		Name: "test",

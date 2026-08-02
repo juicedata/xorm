@@ -1369,8 +1369,20 @@ func TestUpdateIgnoreOnlyFromDBFields(t *testing.T) {
 	}
 	assert.NoError(t, PrepareEngine())
 	assertSync(t, new(TestOnlyFromDBField))
+	onlyFromDBColumnName := testEngine.GetColumnMapper().Obj2Table("OnlyFromDBField")
+	_, err := testEngine.Exec(testEngine.Dialect().AddColumnSQL(
+		testEngine.TableName(new(TestOnlyFromDBField)),
+		&schemas.Column{
+			Name:           onlyFromDBColumnName,
+			SQLType:        schemas.SQLType{Name: schemas.Varchar},
+			Length:         255,
+			Nullable:       true,
+			DefaultIsEmpty: true,
+		},
+	))
+	assert.NoError(t, err)
 
-	_, err := testEngine.Insert(&TestOnlyFromDBField{
+	_, err = testEngine.Insert(&TestOnlyFromDBField{
 		Id:              1,
 		OnlyFromDBField: "a",
 		OnlyToDBField:   "b",

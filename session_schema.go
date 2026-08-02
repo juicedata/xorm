@@ -40,6 +40,10 @@ func (session *Session) createTable(bean any) error {
 		return err
 	}
 
+	return session.createCurrentTable()
+}
+
+func (session *Session) createCurrentTable() error {
 	session.statement.RefTable.StoreEngine = session.statement.StoreEngine
 	session.statement.RefTable.Charset = session.statement.Charset
 	tableName := session.statement.TableName()
@@ -79,6 +83,10 @@ func (session *Session) createIndexes(bean any) error {
 		return err
 	}
 
+	return session.createCurrentIndexes()
+}
+
+func (session *Session) createCurrentIndexes() error {
 	sqls := session.statement.GenIndexSQL()
 	for _, sqlStr := range sqls {
 		_, err := session.exec(sqlStr)
@@ -102,6 +110,10 @@ func (session *Session) createUniques(bean any) error {
 		return err
 	}
 
+	return session.createCurrentUniques()
+}
+
+func (session *Session) createCurrentUniques() error {
 	sqls := session.statement.GenUniqueSQL()
 	for _, sqlStr := range sqls {
 		_, err := session.exec(sqlStr)
