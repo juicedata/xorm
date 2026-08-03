@@ -237,6 +237,11 @@ func (db *mysql) Version(ctx context.Context, queryer core.Queryer) (*schemas.Ve
 func (db *mysql) Features() *DialectFeatures {
 	return &DialectFeatures{
 		AutoincrMode: IncrAutoincrMode,
+		ColumnSync: ColumnSyncFeatures{
+			TextFromVarchar:     true,
+			VarcharLengthChange: true,
+			ColumnComment:       true,
+		},
 	}
 }
 

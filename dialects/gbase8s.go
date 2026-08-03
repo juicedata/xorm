@@ -554,6 +554,9 @@ func (db *gbase8s) Version(ctx context.Context, queryer core.Queryer) (*schemas.
 func (db *gbase8s) Features() *DialectFeatures {
 	return &DialectFeatures{
 		AutoincrMode: IncrAutoincrMode,
+		ColumnSync: ColumnSyncFeatures{
+			ColumnComment: true,
+		},
 	}
 }
 

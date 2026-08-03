@@ -5,165 +5,215 @@
 package xorm
 
 import (
-	"math/big"
 	"strings"
 
+	"xorm.io/xorm/dialects"
 	"xorm.io/xorm/internal/utils"
 	"xorm.io/xorm/schemas"
 )
 
-var displayWidthNumericTypes = map[string]struct{}{
-	schemas.BigInt:    {},
-	schemas.Int:       {},
-	schemas.Integer:   {},
-	schemas.MediumInt: {},
-	schemas.SmallInt:  {},
-	schemas.TinyInt:   {},
+// columnTypeSyncAction is the action to take when a struct column's type
+// does not render identically to the database column's type.
+type columnTypeSyncAction int
+
+const (
+	// columnTypeSyncActionNone means the difference is silently accepted.
+	columnTypeSyncActionNone columnTypeSyncAction = iota
+	// columnTypeSyncActionWarn means a warning is logged but nothing changes.
+	columnTypeSyncActionWarn
+	// columnTypeSyncActionWarnTextFromVarchar means a warning is logged for
+	// an unsupported text-from-varchar conversion. v1 logs this with a
+	// trailing newline, unlike the plain columnTypeSyncActionWarn message,
+	// so it needs its own action to reproduce that format exactly.
+	columnTypeSyncActionWarnTextFromVarchar
+	// columnTypeSyncActionModify means ModifyColumnSQL converts the column type.
+	columnTypeSyncActionModify
+	// columnTypeSyncActionModifyVarcharExpand means ModifyColumnSQL widens a varchar column.
+	columnTypeSyncActionModifyVarcharExpand
+)
+
+// columnSyncDecision is what Sync should do for one column once its
+// comparison against the database column is known.
+type columnSyncDecision struct {
+	typeAction    columnTypeSyncAction
+	modifyComment bool
+	warnDefault   bool
+	warnNullable  bool
 }
 
-func columnDefaultsMatch(col, oriCol *schemas.Column) bool {
+// resolveColumnTypeSyncAction decides what to do about a type difference.
+// It mirrors the inner switch of v1's Sync column loop:
+//   - text-from-varchar always gets a decision (modify if the dialect
+//     supports it, otherwise warn);
+//   - varchar-to-varchar only modifies when the dialect supports widening
+//     and the database column is actually shorter, and stays silent
+//     otherwise (no warning for a shrink or an unsupported dialect);
+//   - anything else warns, unless the actual type is exactly the expected
+//     type's base name - resolved through the dialect's synonym alias in
+//     either direction, so both "NUMERIC" and "DECIMAL" struct types match
+//     a literal "NUMERIC(10,2)" column type the same way - followed by
+//     "(...)", in which case it stays silent.
+func resolveColumnTypeSyncAction(alias func(string) string, features dialects.ColumnSyncFeatures, comparison dialects.ColumnComparison) columnTypeSyncAction {
+	if !comparison.Type.IsDifferent() {
+		return columnTypeSyncActionNone
+	}
+
+	expectedType := comparison.Type.Expected
+	actualType := comparison.Type.Actual
+
 	switch {
-	case col.IsAutoIncrement:
-		return true
-	case col.DefaultIsEmpty && oriCol.DefaultIsEmpty:
-		return true
-	case col.DefaultIsEmpty:
-		return nullableNullDefault(col, oriCol)
-	case oriCol.DefaultIsEmpty:
-		return nullableNullDefault(oriCol, col)
-	}
-
-	return normalizeColumnDefaultValue(col.SQLType, col.Default) ==
-		normalizeColumnDefaultValue(col.SQLType, oriCol.Default)
-}
-
-func nullableNullDefault(emptyDefaultCol, explicitDefaultCol *schemas.Column) bool {
-	if !emptyDefaultCol.Nullable || !explicitDefaultCol.Nullable {
-		return false
-	}
-
-	return strings.EqualFold(strings.TrimSpace(explicitDefaultCol.Default), "NULL")
-}
-
-func normalizeColumnDefaultValue(sqlType schemas.SQLType, defaultValue string) string {
-	normalized := strings.TrimSpace(defaultValue)
-	if normalized == "" {
-		return normalized
-	}
-
-	if sqlType.IsBool() {
-		switch strings.ToLower(trimDefaultQuotes(normalized)) {
-		case "1", "true":
-			return "true"
-		case "0", "false":
-			return "false"
+	case expectedType == schemas.Text && strings.HasPrefix(actualType, schemas.Varchar):
+		if features.TextFromVarchar {
+			return columnTypeSyncActionModify
 		}
-	}
-
-	if sqlType.IsNumeric() {
-		if numeric, ok := normalizeNumericDefaultValue(normalized); ok {
-			return numeric
+		return columnTypeSyncActionWarnTextFromVarchar
+	case strings.HasPrefix(actualType, schemas.Varchar) && strings.HasPrefix(expectedType, schemas.Varchar):
+		if features.VarcharLengthChange && comparison.Actual.Length < comparison.Expected.Length {
+			return columnTypeSyncActionModifyVarcharExpand
 		}
-	}
-
-	return normalized
-}
-
-func normalizeNumericDefaultValue(defaultValue string) (string, bool) {
-	normalized := trimDefaultQuotes(defaultValue)
-	rat, ok := new(big.Rat).SetString(normalized)
-	if !ok {
-		return "", false
-	}
-
-	return rat.RatString(), true
-}
-
-func trimDefaultQuotes(defaultValue string) string {
-	if len(defaultValue) < 2 {
-		return defaultValue
-	}
-
-	if (defaultValue[0] == '\'' && defaultValue[len(defaultValue)-1] == '\'') ||
-		(defaultValue[0] == '"' && defaultValue[len(defaultValue)-1] == '"') {
-		return defaultValue[1 : len(defaultValue)-1]
-	}
-
-	return defaultValue
-}
-
-func normalizeColumnTypeForComparison(alias func(string) string, columnType string) string {
-	normalized := strings.ToUpper(strings.TrimSpace(columnType))
-	if normalized == "" {
-		return normalized
-	}
-
-	unsignedSuffix := ""
-	if strings.HasSuffix(normalized, " UNSIGNED") {
-		unsignedSuffix = " UNSIGNED"
-		normalized = strings.TrimSpace(strings.TrimSuffix(normalized, unsignedSuffix))
-	}
-
-	baseType := strings.ToUpper(strings.TrimSpace(schemas.SQLTypeName(normalized)))
-	typeSuffix := strings.TrimPrefix(normalized, baseType)
-	if _, ok := displayWidthNumericTypes[baseType]; ok {
-		normalized = baseType
-	} else {
-		normalized = baseType + typeSuffix
-	}
-
-	if alias != nil {
-		aliasedBaseType := strings.ToUpper(alias(baseType))
-		if _, ok := displayWidthNumericTypes[baseType]; ok {
-			normalized = aliasedBaseType
-		} else {
-			normalized = aliasedBaseType + typeSuffix
-		}
-	}
-
-	if unsignedSuffix != "" && !strings.HasSuffix(normalized, unsignedSuffix) {
-		normalized += unsignedSuffix
-	}
-
-	return normalized
-}
-
-func columnUsesCompatibleJSONType(col *schemas.Column, currentType string) bool {
-	if col == nil {
-		return false
-	}
-
-	currentBaseType := strings.ToUpper(strings.TrimSpace(schemas.SQLTypeName(currentType)))
-	switch {
-	case col.IsJSONB:
-		return currentBaseType == schemas.Jsonb
-	case col.IsJSON:
-		return currentBaseType == schemas.Json
+		return columnTypeSyncActionNone
 	default:
-		return false
+		if columnTypeBaseNameMatchesPrefix(alias, expectedType, actualType) {
+			return columnTypeSyncActionNone
+		}
+		return columnTypeSyncActionWarn
 	}
 }
 
-func columnTypesMatch(alias func(string) string, expectedCol, currentCol *schemas.Column, expectedType, currentType string) bool {
+// columnTypeBaseNameMatchesPrefix reports whether actualType is exactly
+// expectedType's base name, or a dialect synonym of it (checked in either
+// direction so it does not matter which of two synonymous struct tags -
+// e.g. "NUMERIC" or "DECIMAL" - the caller used), followed by a
+// parenthesized length/precision suffix. expectedType itself must not carry
+// its own suffix: an already-sized expected type (such as "DECIMAL(19,4)")
+// is a genuine precision mismatch against a differently-sized actual type,
+// not this bare-declaration case.
+//
+// This intentionally diverges from v1's byte-exact
+// strings.HasPrefix(actualType, expectedType) && actualType[len(expectedType)] == '('
+// check, which 20b43165 otherwise preserves byte-for-byte. An exhaustive
+// sweep of all schemas.SqlTypes names on both sides, across four length
+// shapes and mysql/postgres/mssql/sqlite3/oracle, found exactly one
+// divergent class: a bare "DECIMAL" expected type against a sized
+// "NUMERIC(...)" actual type, on mysql and postgres only (the only two
+// dialects that alias "numeric" to "decimal" at all); every other
+// combination, and every other dialect, matches v1 unchanged. That one
+// class is a direct consequence of the numeric_precision/numeric_scale
+// read-back fix earlier in this same commit: populating a real column's
+// Length/Length2 is what first let a bare "DECIMAL" struct tag and a sized
+// "NUMERIC(p,s)" column diverge from a bare "NUMERIC" struct tag against
+// the same column, which v1's unaliased check already silenced.
+func columnTypeBaseNameMatchesPrefix(alias func(string) string, expectedType, actualType string) bool {
+	parenIdx := strings.Index(actualType, "(")
+	if parenIdx <= 0 {
+		return false
+	}
+	actualBase := actualType[:parenIdx]
+
+	if strings.EqualFold(actualBase, expectedType) {
+		return true
+	}
 	if alias == nil {
-		alias = func(columnType string) string {
-			return columnType
-		}
+		return false
+	}
+	return strings.EqualFold(actualBase, alias(expectedType)) || strings.EqualFold(alias(actualBase), expectedType)
+}
+
+// resolveBareVarcharSyncAction handles v1's second outer-switch case,
+// `case expectedType == schemas.Varchar`, which only fires once the first
+// case (`!columnTypesMatch`, i.e. comparison.Type.IsDifferent()) is false.
+// mysql/postgres/gbase8s only render a bare "VARCHAR" (no length suffix)
+// when Length == 0, so `actual.Length < expected.Length` can never hold
+// here and this arm can never actually widen a column - but v1 still
+// dedicates an outer-switch case to it, and reaching that case, taken or
+// not, prevents the next case (comment sync) from ever running for that
+// column. It must be kept as its own branch so that exclusivity holds.
+func resolveBareVarcharSyncAction(features dialects.ColumnSyncFeatures, comparison dialects.ColumnComparison) columnTypeSyncAction {
+	if features.VarcharLengthChange && comparison.Actual.Length < comparison.Expected.Length {
+		return columnTypeSyncActionModifyVarcharExpand
+	}
+	return columnTypeSyncActionNone
+}
+
+// buildColumnSyncDecision turns a ColumnComparison into a columnSyncDecision.
+// It mirrors v1's single outer switch, which has exactly one of four
+// mutually exclusive outcomes for a column:
+//  1. the type comparison differs (resolveColumnTypeSyncAction decides
+//     what, if anything, to do);
+//  2. the type comparison already matches and the expected type renders as
+//     a bare "VARCHAR" (resolveBareVarcharSyncAction, effectively a no-op);
+//  3. the type comparison already matches, the expected type is not a bare
+//     "VARCHAR", and the comment differs (sync the comment);
+//  4. none of the above (nothing to do for the type/comment).
+//
+// Because Go's switch takes the first matching case, v1 could reach the
+// comment case only through outcome 3, never through 1 or 2 - even when
+// those arms performed no SQL and logged nothing. Comment sync must stay
+// unreachable from 1 and 2 for the same reason, which is why it is a
+// separate switch case here rather than a condition on the resolved
+// typeAction.
+func buildColumnSyncDecision(alias func(string) string, features dialects.ColumnSyncFeatures, comparison dialects.ColumnComparison) columnSyncDecision {
+	decision := columnSyncDecision{
+		warnDefault:  comparison.Default.IsDifferent(),
+		warnNullable: comparison.Nullable.IsDifferent(),
 	}
 
-	if expectedType == currentType {
-		return true
+	switch {
+	case comparison.Type.IsDifferent():
+		decision.typeAction = resolveColumnTypeSyncAction(alias, features, comparison)
+	case comparison.Type.Expected == schemas.Varchar:
+		decision.typeAction = resolveBareVarcharSyncAction(features, comparison)
+	case comparison.Comment.IsDifferent():
+		decision.modifyComment = features.ColumnComment
 	}
 
-	if columnUsesCompatibleJSONType(expectedCol, currentType) || columnUsesCompatibleJSONType(currentCol, expectedType) {
-		return true
+	return decision
+}
+
+// applyColumnSyncDecision executes at most one ModifyColumnSQL for the
+// column, then logs the default/nullable warnings. It mirrors v1's
+// structure of assigning any exec error to a shared local, always running
+// the default/nullable checks, and only returning the error afterwards -
+// so a failing ALTER still produces both warnings before Sync aborts.
+func applyColumnSyncDecision(session *Session, tableName, tableNameWithSchema string, comparison dialects.ColumnComparison, decision columnSyncDecision) error {
+	engine := session.engine
+	expected := comparison.Expected
+	actual := comparison.Actual
+
+	var err error
+
+	switch decision.typeAction {
+	case columnTypeSyncActionModifyVarcharExpand:
+		engine.logger.Infof("Table %s column %s change type from varchar(%d) to varchar(%d)\n",
+			tableNameWithSchema, expected.Name, actual.Length, expected.Length)
+		_, err = session.exec(engine.dialect.ModifyColumnSQL(tableNameWithSchema, expected))
+	case columnTypeSyncActionModify:
+		engine.logger.Infof("Table %s column %s change type from %s to %s\n",
+			tableNameWithSchema, expected.Name, comparison.Type.Actual, comparison.Type.Expected)
+		_, err = session.exec(engine.dialect.ModifyColumnSQL(tableNameWithSchema, expected))
+	case columnTypeSyncActionWarn:
+		engine.logger.Warnf("Table %s column %s db type is %s, struct type is %s",
+			tableNameWithSchema, expected.Name, comparison.Type.Actual, comparison.Type.Expected)
+	case columnTypeSyncActionWarnTextFromVarchar:
+		engine.logger.Warnf("Table %s column %s db type is %s, struct type is %s\n",
+			tableNameWithSchema, expected.Name, comparison.Type.Actual, comparison.Type.Expected)
 	}
 
-	if normalizeColumnTypeForComparison(alias, expectedType) == normalizeColumnTypeForComparison(alias, currentType) {
-		return true
+	if decision.modifyComment {
+		_, err = session.exec(engine.dialect.ModifyColumnSQL(tableNameWithSchema, expected))
 	}
 
-	return strings.EqualFold(schemas.SQLTypeName(currentType), alias(schemas.SQLTypeName(expectedType)))
+	if decision.warnDefault {
+		engine.logger.Warnf("Table %s Column %s db default is %s, struct default is %s",
+			tableName, expected.Name, actual.Default, expected.Default)
+	}
+
+	if decision.warnNullable {
+		engine.logger.Warnf("Table %s Column %s db nullable is %v, struct nullable is %v",
+			tableName, expected.Name, actual.Nullable, expected.Nullable)
+	}
+
+	return err
 }
 
 type SyncOptions struct {
@@ -366,67 +416,9 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 				continue
 			}
 
-			err = nil
-			expectedType := engine.dialect.SQLType(col)
-			curType := engine.dialect.SQLType(oriCol)
-			switch {
-			case !columnTypesMatch(engine.dialect.Alias, col, oriCol, expectedType, curType):
-				switch {
-				case expectedType == schemas.Text && strings.HasPrefix(curType, schemas.Varchar):
-					// currently only support mysql & postgres
-					if engine.dialect.URI().DBType == schemas.MYSQL ||
-						engine.dialect.URI().DBType == schemas.POSTGRES {
-						engine.logger.Infof("Table %s column %s change type from %s to %s\n",
-							tbNameWithSchema, col.Name, curType, expectedType)
-						_, err = session.exec(engine.dialect.ModifyColumnSQL(tbNameWithSchema, col))
-					} else {
-						engine.logger.Warnf("Table %s column %s db type is %s, struct type is %s\n",
-							tbNameWithSchema, col.Name, curType, expectedType)
-					}
-				case strings.HasPrefix(curType, schemas.Varchar) && strings.HasPrefix(expectedType, schemas.Varchar):
-					if engine.dialect.URI().DBType == schemas.POSTGRES ||
-						engine.dialect.URI().DBType == schemas.MYSQL {
-						if oriCol.Length < col.Length {
-							engine.logger.Infof("Table %s column %s change type from varchar(%d) to varchar(%d)\n",
-								tbNameWithSchema, col.Name, oriCol.Length, col.Length)
-							_, err = session.exec(engine.dialect.ModifyColumnSQL(tbNameWithSchema, col))
-						}
-					}
-				default:
-					if !(strings.HasPrefix(curType, expectedType) && curType[len(expectedType)] == '(') {
-						if !columnTypesMatch(engine.dialect.Alias, col, oriCol, expectedType, curType) {
-							engine.logger.Warnf("Table %s column %s db type is %s, struct type is %s",
-								tbNameWithSchema, col.Name, curType, expectedType)
-						}
-					}
-				}
-			case expectedType == schemas.Varchar:
-				if engine.dialect.URI().DBType == schemas.POSTGRES ||
-					engine.dialect.URI().DBType == schemas.MYSQL {
-					if oriCol.Length < col.Length {
-						engine.logger.Infof("Table %s column %s change type from varchar(%d) to varchar(%d)\n",
-							tbNameWithSchema, col.Name, oriCol.Length, col.Length)
-						_, err = session.exec(engine.dialect.ModifyColumnSQL(tbNameWithSchema, col))
-					}
-				}
-			case col.Comment != oriCol.Comment:
-				if engine.dialect.URI().DBType == schemas.POSTGRES ||
-					engine.dialect.URI().DBType == schemas.GBASE8S ||
-					engine.dialect.URI().DBType == schemas.MYSQL {
-					_, err = session.exec(engine.dialect.ModifyColumnSQL(tbNameWithSchema, col))
-				}
-			}
-
-			if !columnDefaultsMatch(col, oriCol) {
-				engine.logger.Warnf("Table %s Column %s db default is %s, struct default is %s",
-					tbName, col.Name, oriCol.Default, col.Default)
-			}
-			if col.Nullable != oriCol.Nullable {
-				engine.logger.Warnf("Table %s Column %s db nullable is %v, struct nullable is %v",
-					tbName, col.Name, oriCol.Nullable, col.Nullable)
-			}
-
-			if err != nil {
+			comparison := engine.dialect.CompareColumns(col, oriCol)
+			decision := buildColumnSyncDecision(engine.dialect.Alias, engine.dialect.Features().ColumnSync, comparison)
+			if err = applyColumnSyncDecision(session, tbName, tbNameWithSchema, comparison, decision); err != nil {
 				return nil, err
 			}
 		}

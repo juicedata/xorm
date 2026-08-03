@@ -970,6 +970,11 @@ func (db *postgres) SQLType(c *schemas.Column) string {
 func (db *postgres) Features() *DialectFeatures {
 	return &DialectFeatures{
 		AutoincrMode: IncrAutoincrMode,
+		ColumnSync: ColumnSyncFeatures{
+			TextFromVarchar:     true,
+			VarcharLengthChange: true,
+			ColumnComment:       true,
+		},
 	}
 }
 
@@ -1091,7 +1096,8 @@ func (db *postgres) IsColumnExist(queryer core.Queryer, ctx context.Context, tab
 
 func (db *postgres) GetColumns(queryer core.Queryer, ctx context.Context, tableName string) ([]string, map[string]*schemas.Column, error) {
 	args := []any{tableName}
-	s := `SELECT column_name, column_default, is_nullable, data_type, character_maximum_length, description,
+	s := `SELECT column_name, column_default, is_nullable, data_type, character_maximum_length,
+    numeric_precision, numeric_scale, description,
     COALESCE(bool_or(p.contype = 'p'), false) AS primarykey,
     COALESCE(bool_or(p.contype = 'u'), false) AS uniquekey
 	FROM pg_attribute f
@@ -1103,7 +1109,8 @@ func (db *postgres) GetColumns(queryer core.Queryer, ctx context.Context, tableN
     LEFT JOIN pg_class AS g ON p.confrelid = g.oid
     LEFT JOIN INFORMATION_SCHEMA.COLUMNS s ON s.column_name=f.attname AND c.relname=s.table_name AND n.nspname = s.table_schema
 	WHERE n.nspname = s.table_schema AND c.relkind = 'r' AND c.relname = $1%s AND f.attnum > 0
-	GROUP BY s.column_name, s.column_default, s.is_nullable, s.data_type, s.character_maximum_length, de.description, f.attnum
+	GROUP BY s.column_name, s.column_default, s.is_nullable, s.data_type, s.character_maximum_length,
+    s.numeric_precision, s.numeric_scale, de.description, f.attnum
 	ORDER BY f.attnum;`
 
 	schema := db.getSchema()
@@ -1128,9 +1135,10 @@ func (db *postgres) GetColumns(queryer core.Queryer, ctx context.Context, tableN
 		col.Indexes = make(map[string]int)
 
 		var colName, isNullable, dataType string
-		var maxLenStr, colDefault, description *string
+		var maxLenStr, numericPrecisionStr, numericScaleStr, colDefault, description *string
 		var isPK, isUnique bool
-		err = rows.Scan(&colName, &colDefault, &isNullable, &dataType, &maxLenStr, &description, &isPK, &isUnique)
+		err = rows.Scan(&colName, &colDefault, &isNullable, &dataType, &maxLenStr,
+			&numericPrecisionStr, &numericScaleStr, &description, &isPK, &isUnique)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1138,6 +1146,20 @@ func (db *postgres) GetColumns(queryer core.Queryer, ctx context.Context, tableN
 		var maxLen int64
 		if maxLenStr != nil {
 			maxLen, err = strconv.ParseInt(*maxLenStr, 10, 64)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+
+		var numericPrecision, numericScale int64
+		if numericPrecisionStr != nil {
+			numericPrecision, err = strconv.ParseInt(*numericPrecisionStr, 10, 64)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		if numericScaleStr != nil {
+			numericScale, err = strconv.ParseInt(*numericScaleStr, 10, 64)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1222,6 +1244,15 @@ func (db *postgres) GetColumns(queryer core.Queryer, ctx context.Context, tableN
 		}
 
 		col.Length = maxLen
+		switch strings.ToLower(dataType) {
+		case "numeric", "decimal":
+			// information_schema reports numeric_precision for every numeric
+			// type (smallint, integer, real, ...), not just arbitrary-precision
+			// ones, so only trust it for the user-declared NUMERIC/DECIMAL(p,s)
+			// case; a bare NUMERIC has a NULL precision.
+			col.Length = numericPrecision
+			col.Length2 = numericScale
+		}
 
 		if !col.DefaultIsEmpty {
 			if col.SQLType.IsText() {

@@ -45,9 +45,19 @@ const (
 	SequenceAutoincrMode
 )
 
+// ColumnSyncFeatures represents which column-reconciliation actions Sync
+// is allowed to perform automatically for a dialect. Values must mirror
+// the DBType checks that used to be hardcoded in sync.go.
+type ColumnSyncFeatures struct {
+	TextFromVarchar     bool // can widen varchar columns to text during sync
+	VarcharLengthChange bool // can widen varchar length during sync
+	ColumnComment       bool // can apply comment-only column sync changes
+}
+
 // DialectFeatures represents a dialect parameters
 type DialectFeatures struct {
-	AutoincrMode int // 0 autoincrement column, 1 sequence
+	AutoincrMode int                // 0 autoincrement column, 1 sequence
+	ColumnSync   ColumnSyncFeatures // sync capabilities for column reconciliation
 }
 
 // Dialect represents a kind of database
@@ -58,6 +68,7 @@ type Dialect interface {
 	Features() *DialectFeatures
 
 	SQLType(*schemas.Column) string
+	CompareColumns(expected, actual *schemas.Column) ColumnComparison
 	Alias(string) string       // return what a sql type's alias of
 	ColumnTypeKind(string) int // database column type kind
 
