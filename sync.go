@@ -5,6 +5,7 @@
 package xorm
 
 import (
+	"fmt"
 	"strings"
 
 	"xorm.io/xorm/dialects"
@@ -37,9 +38,17 @@ const (
 type columnSyncDecision struct {
 	typeAction    columnTypeSyncAction
 	modifyComment bool
+	// modifyCommentOnly is set alongside modifyComment when
+	// resolveCommentSyncDecision resolved the sync through a dialect's
+	// comment-only DDL path (ColumnSyncFeatures.ColumnCommentOnly), so
+	// applyColumnSyncDecision calls ModifyColumnCommentSQL - which emits
+	// no type-altering clause at all - instead of the full-rewrite
+	// ModifyColumnSQL.
+	modifyCommentOnly bool
 	// commentSkippedTypeMismatch is set when the comment differs and the
 	// dialect supports comment sync, but resolveCommentSyncDecision
-	// refused to run it because the rendered types are not byte-identical.
+	// refused to run it because the rendered types are not byte-identical
+	// and the dialect has no comment-only DDL path to fall back to.
 	// applyColumnSyncDecision logs this at Infof (not Warnf) so the
 	// trade-off is visible instead of silent, without resurfacing the
 	// warnings xorm/xorm#2583 and go-gitea/gitea#22275 removed: every row
@@ -57,12 +66,14 @@ type columnSyncDecision struct {
 //   - varchar-to-varchar only modifies when the dialect supports widening
 //     and the database column is actually shorter, and stays silent
 //     otherwise (no warning for a shrink or an unsupported dialect);
-//   - anything else warns, unless the actual type is exactly the expected
-//     type's base name - resolved through the dialect's synonym alias in
-//     either direction, so both "NUMERIC" and "DECIMAL" struct types match
-//     a literal "NUMERIC(10,2)" column type the same way - followed by
-//     "(...)", in which case it stays silent.
-func resolveColumnTypeSyncAction(alias func(string) string, features dialects.ColumnSyncFeatures, comparison dialects.ColumnComparison) columnTypeSyncAction {
+//   - anything else warns. A bare struct type against a differently-sized
+//     literal column type of the same base name (in either synonym
+//     direction, e.g. "NUMERIC" struct tag against a literal
+//     "DECIMAL(10,2)" column) never reaches this arm at all: compareColumnTypes'
+//     level 4 base-sql-type-name fallback already classifies it
+//     ColumnCompareEquivalent and IsDifferent() is false, so the early
+//     return above handles it.
+func resolveColumnTypeSyncAction(features dialects.ColumnSyncFeatures, comparison dialects.ColumnComparison) columnTypeSyncAction {
 	if !comparison.Type.IsDifferent() {
 		return columnTypeSyncActionNone
 	}
@@ -82,9 +93,6 @@ func resolveColumnTypeSyncAction(alias func(string) string, features dialects.Co
 		}
 		return columnTypeSyncActionNone
 	default:
-		if columnTypeBaseNameMatchesPrefix(alias, expectedType, actualType) {
-			return columnTypeSyncActionNone
-		}
 		return columnTypeSyncActionWarn
 	}
 }
@@ -96,45 +104,6 @@ func resolveColumnTypeSyncAction(alias func(string) string, features dialects.Co
 // since no dialect aliases varchar to or from another type name.
 func isVarcharToVarchar(expectedType, actualType string) bool {
 	return strings.HasPrefix(actualType, schemas.Varchar) && strings.HasPrefix(expectedType, schemas.Varchar)
-}
-
-// columnTypeBaseNameMatchesPrefix reports whether actualType is exactly
-// expectedType's base name, or a dialect synonym of it (checked in either
-// direction so it does not matter which of two synonymous struct tags -
-// e.g. "NUMERIC" or "DECIMAL" - the caller used), followed by a
-// parenthesized length/precision suffix. expectedType itself must not carry
-// its own suffix: an already-sized expected type (such as "DECIMAL(19,4)")
-// is a genuine precision mismatch against a differently-sized actual type,
-// not this bare-declaration case.
-//
-// This intentionally diverges from v1's byte-exact
-// strings.HasPrefix(actualType, expectedType) && actualType[len(expectedType)] == '('
-// check, which 20b43165 otherwise preserves byte-for-byte. An exhaustive
-// sweep of all schemas.SqlTypes names on both sides, across four length
-// shapes and mysql/postgres/mssql/sqlite3/oracle, found exactly one
-// divergent class: a bare "DECIMAL" expected type against a sized
-// "NUMERIC(...)" actual type, on mysql and postgres only (the only two
-// dialects that alias "numeric" to "decimal" at all); every other
-// combination, and every other dialect, matches v1 unchanged. That one
-// class is a direct consequence of the numeric_precision/numeric_scale
-// read-back fix earlier in this same commit: populating a real column's
-// Length/Length2 is what first let a bare "DECIMAL" struct tag and a sized
-// "NUMERIC(p,s)" column diverge from a bare "NUMERIC" struct tag against
-// the same column, which v1's unaliased check already silenced.
-func columnTypeBaseNameMatchesPrefix(alias func(string) string, expectedType, actualType string) bool {
-	parenIdx := strings.Index(actualType, "(")
-	if parenIdx <= 0 {
-		return false
-	}
-	actualBase := actualType[:parenIdx]
-
-	if strings.EqualFold(actualBase, expectedType) {
-		return true
-	}
-	if alias == nil {
-		return false
-	}
-	return strings.EqualFold(actualBase, alias(expectedType)) || strings.EqualFold(alias(actualBase), expectedType)
 }
 
 // resolveBareVarcharSyncAction handles v1's second outer-switch case,
@@ -181,17 +150,31 @@ func resolveVarcharWidenSyncAction(features dialects.ColumnSyncFeatures, compari
 }
 
 // resolveCommentSyncDecision is the single place that decides whether a
-// differing comment should be synced. applyColumnSyncDecision's
-// modifyComment branch runs a full ModifyColumnSQL using the column's
-// entire rendered Expected definition, not just its comment, so syncing a
-// comment when the rendered types are merely ColumnCompareEquivalent (or
-// worse, ColumnCompareDifferent) silently rewrites the column's type as a
-// side effect - see xorm/xorm#2591, where a real MySQL/MariaDB
-// DECIMAL(19,4) column against a struct tagged DECIMAL(10,2) plus a
-// comment change rounded already-stored data with Sync reporting success.
-// Requiring ColumnCompareEqual makes ModifyColumnSQL's own type text a
-// no-op, since it reissues the column's own already-matching rendered
-// type.
+// differing comment should be synced, and whether to run it through the
+// dialect's comment-only DDL (ColumnSyncFeatures.ColumnCommentOnly) or its
+// full-rewrite ModifyColumnSQL. For a dialect without a comment-only path,
+// applyColumnSyncDecision's modifyComment branch runs a full
+// ModifyColumnSQL using the column's entire rendered Expected definition,
+// not just its comment, so syncing a comment when the rendered types are
+// merely ColumnCompareEquivalent (or worse, ColumnCompareDifferent)
+// silently rewrites the column's type as a side effect - see
+// xorm/xorm#2591, where a real MySQL/MariaDB DECIMAL(19,4) column against
+// a struct tagged DECIMAL(10,2) plus a comment change rounded
+// already-stored data with Sync reporting success. Requiring
+// ColumnCompareEqual there makes ModifyColumnSQL's own type text a no-op,
+// since it reissues the column's own already-matching rendered type.
+//
+// A dialect with ColumnCommentOnly true (postgres, gbase8s) does not need
+// that restriction: ModifyColumnCommentSQL never renders a type clause at
+// all, so it is safe whenever the type comparison is not genuinely
+// ColumnCompareDifferent - which buildColumnSyncDecision's own switch
+// already guarantees before reaching this function (see its comment).
+// This also closes xorm/xorm#2594's residual hole: a real SMALLINT column
+// backed by nextval(...) renders "SERIAL" the same as a genuine
+// integer-backed serial column (postgres.SQLType's default arm), so the
+// pair is ColumnCompareEqual even though ALTER COLUMN ... TYPE INTEGER
+// would genuinely widen it - the comment-only path avoids that ALTER
+// entirely, rather than depending on the type substitution being exact.
 //
 // Every switch arm in buildColumnSyncDecision that might reach a comment
 // sync MUST call this function rather than checking
@@ -200,10 +183,11 @@ func resolveVarcharWidenSyncAction(features dialects.ColumnSyncFeatures, compari
 // reopen this hole as long as it goes through here instead of
 // reimplementing the check.
 //
-// The cost is real and not marginal - an Equivalent-but-not-Equal pair
-// with a differing comment no longer gets its comment synced, on any
-// dialect and struct tag combination that lands in ColumnCompareEquivalent
-// rather than ColumnCompareEqual. Three shapes are common enough to name:
+// The cost of requiring ColumnCompareEqual is real and not marginal for a
+// dialect stuck on the full-rewrite path - an Equivalent-but-not-Equal
+// pair with a differing comment no longer gets its comment synced, on any
+// struct tag combination that lands in ColumnCompareEquivalent rather than
+// ColumnCompareEqual. Three shapes are common enough to name:
 //   - MariaDB 10.6 and MySQL <= 8.0.18 report a plain INT column as
 //     "int(11)"; a bare `xorm:"INT"` struct tag never renders a width, so
 //     every commented int-family column stops syncing its comment, on
@@ -217,24 +201,39 @@ func resolveVarcharWidenSyncAction(features dialects.ColumnSyncFeatures, compari
 //
 // In all three cases the reissued ModifyColumnSQL type text would have
 // been a provable no-op ("INT(11)" == "INT", "TEXT(65535)" == "TEXT",
-// "DECIMAL(10,2)" == "NUMERIC(10,2)" for Sync's purposes) - the gate is
-// deliberately conservative and blocks these harmless cases along with
-// the genuinely dangerous ones (a real precision or length mismatch)
-// because compareColumnTypes' Equivalent status does not distinguish
-// "same type, different but harmless spelling" from "same base type,
-// different and unsafe size". Losing a comment update is preferable to
-// silently narrowing or rounding a column, so this trade is accepted as
-// the current default; distinguishing the harmless subset would need a
-// richer status than ColumnCompareEquivalent and is a possible follow-up,
-// not attempted here.
-func resolveCommentSyncDecision(features dialects.ColumnSyncFeatures, comparison dialects.ColumnComparison) (modifyComment, skippedTypeMismatch bool) {
+// "DECIMAL(10,2)" == "NUMERIC(10,2)" for Sync's purposes) - only the third
+// one is recovered today, because postgres has a comment-only path;
+// mysql/mariadb do not (MODIFY COLUMN's comment clause is part of the
+// full column definition, with no standalone equivalent), so the first
+// two stay gated on ColumnCompareEqual and keep paying this cost. Losing
+// a comment update there is preferable to silently narrowing or rounding
+// a column.
+func resolveCommentSyncDecision(features dialects.ColumnSyncFeatures, comparison dialects.ColumnComparison) (modifyComment, commentOnly, skippedTypeMismatch bool) {
 	if !features.ColumnComment || !comparison.Comment.IsDifferent() {
-		return false, false
+		return false, false, false
+	}
+	if features.ColumnCommentOnly {
+		return true, true, false
 	}
 	if comparison.Type.Status != dialects.ColumnCompareEqual {
-		return false, true
+		return false, false, true
 	}
-	return true, false
+	return true, false, false
+}
+
+// columnSyncFeaturesFor returns dialect's ColumnSyncFeatures with
+// ColumnCommentOnly set from a live type assertion against
+// dialects.ColumnCommentModifier, rather than from whatever the dialect's
+// own Features() method happened to say. This is the single place that
+// decides the flag, so it cannot disagree with the actual capability:
+// buildColumnSyncDecision only ever sees ColumnCommentOnly true when
+// dialect genuinely implements ModifyColumnCommentSQL, and
+// applyColumnSyncDecision's own type assertion (see its
+// decision.modifyCommentOnly branch) is checking the exact same fact.
+func columnSyncFeaturesFor(dialect dialects.Dialect) dialects.ColumnSyncFeatures {
+	features := dialect.Features().ColumnSync
+	_, features.ColumnCommentOnly = dialect.(dialects.ColumnCommentModifier)
+	return features
 }
 
 // buildColumnSyncDecision turns a ColumnComparison into a columnSyncDecision.
@@ -292,7 +291,7 @@ func resolveCommentSyncDecision(features dialects.ColumnSyncFeatures, comparison
 // This is the third time this switch's exclusivity has mattered (see the
 // #2585 and #2586 history above); the next person changing it should read
 // this whole comment, not just the case they are touching.
-func buildColumnSyncDecision(alias func(string) string, features dialects.ColumnSyncFeatures, comparison dialects.ColumnComparison) columnSyncDecision {
+func buildColumnSyncDecision(features dialects.ColumnSyncFeatures, comparison dialects.ColumnComparison) columnSyncDecision {
 	decision := columnSyncDecision{
 		warnDefault:  comparison.Default.IsDifferent(),
 		warnNullable: comparison.Nullable.IsDifferent(),
@@ -300,26 +299,30 @@ func buildColumnSyncDecision(alias func(string) string, features dialects.Column
 
 	switch {
 	case comparison.Type.IsDifferent():
-		decision.typeAction = resolveColumnTypeSyncAction(alias, features, comparison)
+		decision.typeAction = resolveColumnTypeSyncAction(features, comparison)
 	case comparison.Type.Expected == schemas.Varchar:
 		decision.typeAction = resolveBareVarcharSyncAction(features, comparison)
 	case isVarcharToVarchar(comparison.Type.Expected, comparison.Type.Actual):
 		decision.typeAction = resolveVarcharWidenSyncAction(features, comparison)
 		if decision.typeAction == columnTypeSyncActionNone {
-			decision.modifyComment, decision.commentSkippedTypeMismatch = resolveCommentSyncDecision(features, comparison)
+			decision.modifyComment, decision.modifyCommentOnly, decision.commentSkippedTypeMismatch = resolveCommentSyncDecision(features, comparison)
 		}
 	case comparison.Comment.IsDifferent():
-		decision.modifyComment, decision.commentSkippedTypeMismatch = resolveCommentSyncDecision(features, comparison)
+		decision.modifyComment, decision.modifyCommentOnly, decision.commentSkippedTypeMismatch = resolveCommentSyncDecision(features, comparison)
 	}
 
 	return decision
 }
 
-// applyColumnSyncDecision executes at most one ModifyColumnSQL for the
-// column, then logs the default/nullable warnings. It mirrors v1's
+// applyColumnSyncDecision executes at most one statement for the column
+// (ModifyColumnSQL, or ModifyColumnCommentSQL for a comment-only
+// decision), then logs the default/nullable warnings. It mirrors v1's
 // structure of assigning any exec error to a shared local, always running
 // the default/nullable checks, and only returning the error afterwards -
-// so a failing ALTER still produces both warnings before Sync aborts.
+// so a failing ALTER still produces both warnings before Sync aborts. A
+// decision.modifyCommentOnly whose dialect turns out not to implement
+// dialects.ColumnCommentModifier follows the same path: err is set, no
+// statement runs, and the warnings still log before the error returns.
 func applyColumnSyncDecision(session *Session, tableName, tableNameWithSchema string, comparison dialects.ColumnComparison, decision columnSyncDecision) error {
 	engine := session.engine
 	expected := comparison.Expected
@@ -345,7 +348,28 @@ func applyColumnSyncDecision(session *Session, tableName, tableNameWithSchema st
 	}
 
 	if decision.modifyComment {
-		_, err = session.exec(engine.dialect.ModifyColumnSQL(tableNameWithSchema, expected))
+		if decision.modifyCommentOnly {
+			modifier, ok := engine.dialect.(dialects.ColumnCommentModifier)
+			if !ok {
+				// decision.modifyCommentOnly is only ever set when the
+				// same type assertion succeeded moments earlier, in
+				// Sync's column loop, which is what sets
+				// features.ColumnCommentOnly in the first place - see
+				// that loop's comment. Reaching here means a decision
+				// was built by hand (as some unit tests do) against a
+				// dialect that does not actually implement
+				// ColumnCommentModifier; failing loudly here is
+				// deliberate, since silently falling back to
+				// ModifyColumnSQL's full rewrite is exactly the
+				// type-rewriting side effect this whole path exists to
+				// rule out.
+				err = fmt.Errorf("xorm: comment-only sync requested for column %q but dialect %T does not implement dialects.ColumnCommentModifier", expected.Name, engine.dialect)
+			} else {
+				_, err = session.exec(modifier.ModifyColumnCommentSQL(tableNameWithSchema, expected))
+			}
+		} else {
+			_, err = session.exec(engine.dialect.ModifyColumnSQL(tableNameWithSchema, expected))
+		}
 	} else if decision.commentSkippedTypeMismatch {
 		engine.logger.Infof("Table %s column %s comment not synced because db type is %s, struct type is %s",
 			tableNameWithSchema, expected.Name, comparison.Type.Actual, comparison.Type.Expected)
@@ -565,7 +589,7 @@ func (session *Session) SyncWithOptions(opts SyncOptions, beans ...any) (*SyncRe
 			}
 
 			comparison := engine.dialect.CompareColumns(col, oriCol)
-			decision := buildColumnSyncDecision(engine.dialect.Alias, engine.dialect.Features().ColumnSync, comparison)
+			decision := buildColumnSyncDecision(columnSyncFeaturesFor(engine.dialect), comparison)
 			if err = applyColumnSyncDecision(session, tbName, tbNameWithSchema, comparison, decision); err != nil {
 				return nil, err
 			}

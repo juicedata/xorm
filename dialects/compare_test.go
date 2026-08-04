@@ -543,9 +543,7 @@ func TestCompareColumnsPostgresSerialNullable(t *testing.T) {
 // "DECIMAL" was compared against the actual side's un-aliased "NUMERIC"
 // and never matched - a bare "NUMERIC" struct type against a literal
 // "NUMERIC(10,2)" db type was reported Different here even though it
-// renders identically to the equivalent "DECIMAL" spelling, and only
-// stayed silent because resolveColumnTypeSyncAction's own
-// columnTypeBaseNameMatchesPrefix guard rescued it a second time. See
+// renders identically to the equivalent "DECIMAL" spelling. See
 // TestResolveColumnTypeSyncActionMySQLNumericPrefixMatchStaysSilent for
 // confirmation that the resulting sync action is unchanged.
 func TestCompareColumnsMySQLNumericPrefixMismatch(t *testing.T) {

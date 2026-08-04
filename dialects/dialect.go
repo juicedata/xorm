@@ -52,6 +52,22 @@ type ColumnSyncFeatures struct {
 	TextFromVarchar     bool // can widen varchar columns to text during sync
 	VarcharLengthChange bool // can widen varchar length during sync
 	ColumnComment       bool // can apply comment-only column sync changes
+	// ColumnCommentOnly reports whether ModifyColumnCommentSQL renders a
+	// statement that changes nothing but the comment - no type clause at
+	// all - so a comment sync can never rewrite the column's type as a
+	// side effect (see sync.go's resolveCommentSyncDecision). A dialect
+	// with ColumnComment true but ColumnCommentOnly false (mysql/mariadb)
+	// only has the full-rewrite ModifyColumnSQL path, which sync.go keeps
+	// gated on the type comparison being ColumnCompareEqual.
+	//
+	// This struct is a plain value so buildColumnSyncDecision and
+	// resolveCommentSyncDecision stay testable in isolation (see
+	// sync_policy_additional_test.go), but for a real dialect this field
+	// must never be set by hand: sync.go's Sync method is the only place
+	// that sets it, and it does so by type-asserting the dialect against
+	// ColumnCommentModifier, so the flag and the implementation cannot
+	// disagree. A dialect's own Features() method must leave it false.
+	ColumnCommentOnly bool
 }
 
 // DialectFeatures represents a dialect parameters
@@ -99,6 +115,21 @@ type Dialect interface {
 
 	Filters() []Filter
 	SetParams(params map[string]string)
+}
+
+// ColumnCommentModifier is implemented by a dialect that can change a
+// column's comment through a standalone statement carrying no
+// type-altering clause at all. It is deliberately NOT part of the
+// Dialect interface: adding a required method there would be a source
+// break for any out-of-tree Dialect implementation that does not embed
+// Base, for a capability only two in-tree dialects (postgres, gbase8s)
+// have. sync.go type-asserts a dialect against this interface instead,
+// which also ties ColumnSyncFeatures.ColumnCommentOnly to the same fact
+// the assertion checks - see Sync's column loop and
+// applyColumnSyncDecision, both of which assert against this interface
+// rather than trusting the flag alone.
+type ColumnCommentModifier interface {
+	ModifyColumnCommentSQL(tableName string, col *schemas.Column) string
 }
 
 // Base represents a basic dialect and all real dialects could embed this struct

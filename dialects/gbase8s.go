@@ -961,6 +961,19 @@ func (db *gbase8s) ModifyColumnSQL(tableName string, col *schemas.Column) string
 	return modifyColumnSQL
 }
 
+// ModifyColumnCommentSQL returns a standalone "COMMENT ON COLUMN ..."
+// statement, with no "ALTER TABLE ... MODIFY ..." clause at all.
+// Implementing this method is what makes gbase8s satisfy
+// dialects.ColumnCommentModifier, which Sync's column loop type-asserts
+// for and uses to set ColumnSyncFeatures.ColumnCommentOnly, so that flag
+// and this method cannot disagree. Sync then calls this for a
+// comment-only difference, so that path can never rewrite the column's
+// type as a side effect - see postgres.ModifyColumnCommentSQL for the
+// same invariant on the other ColumnCommentModifier dialect.
+func (db *gbase8s) ModifyColumnCommentSQL(tableName string, col *schemas.Column) string {
+	return fmt.Sprintf("COMMENT ON COLUMN %s.%s IS '%s'", db.quoter.Quote(tableName), db.quoter.Quote(col.Name), col.Comment)
+}
+
 func (db *gbase8s) IsColumnExist(queryer core.Queryer, ctx context.Context, tableName, colName string) (bool, error) {
 	args := []any{tableName, colName}
 	query := "SELECT colname FROM syscolumnsext c, systables t WHERE c.tabid = t.tabid and tabname = :1 AND colname = :2"

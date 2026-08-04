@@ -64,7 +64,7 @@ func TestResolveColumnTypeSyncActionVarcharShrinkStaysSilent(t *testing.T) {
 	features := dialects.ColumnSyncFeatures{VarcharLengthChange: true}
 	comparison := typeDiffersComparison("VARCHAR(50)", "VARCHAR(100)", 50, 100)
 
-	if got := resolveColumnTypeSyncAction(nil, features, comparison); got != columnTypeSyncActionNone {
+	if got := resolveColumnTypeSyncAction(features, comparison); got != columnTypeSyncActionNone {
 		t.Fatalf("resolveColumnTypeSyncAction() = %v, want columnTypeSyncActionNone", got)
 	}
 }
@@ -73,7 +73,7 @@ func TestResolveColumnTypeSyncActionVarcharLengthChangeUnsupportedStaysSilent(t 
 	features := dialects.ColumnSyncFeatures{VarcharLengthChange: false}
 	comparison := typeDiffersComparison("VARCHAR(100)", "VARCHAR(50)", 100, 50)
 
-	if got := resolveColumnTypeSyncAction(nil, features, comparison); got != columnTypeSyncActionNone {
+	if got := resolveColumnTypeSyncAction(features, comparison); got != columnTypeSyncActionNone {
 		t.Fatalf("resolveColumnTypeSyncAction() = %v, want columnTypeSyncActionNone", got)
 	}
 }
@@ -82,7 +82,7 @@ func TestResolveColumnTypeSyncActionVarcharExpandModifies(t *testing.T) {
 	features := dialects.ColumnSyncFeatures{VarcharLengthChange: true}
 	comparison := typeDiffersComparison("VARCHAR(100)", "VARCHAR(50)", 100, 50)
 
-	if got := resolveColumnTypeSyncAction(nil, features, comparison); got != columnTypeSyncActionModifyVarcharExpand {
+	if got := resolveColumnTypeSyncAction(features, comparison); got != columnTypeSyncActionModifyVarcharExpand {
 		t.Fatalf("resolveColumnTypeSyncAction() = %v, want columnTypeSyncActionModifyVarcharExpand", got)
 	}
 }
@@ -91,7 +91,7 @@ func TestResolveColumnTypeSyncActionTextFromVarcharUnsupportedWarns(t *testing.T
 	features := dialects.ColumnSyncFeatures{TextFromVarchar: false}
 	comparison := typeDiffersComparison(schemas.Text, "VARCHAR(100)", 0, 100)
 
-	if got := resolveColumnTypeSyncAction(nil, features, comparison); got != columnTypeSyncActionWarnTextFromVarchar {
+	if got := resolveColumnTypeSyncAction(features, comparison); got != columnTypeSyncActionWarnTextFromVarchar {
 		t.Fatalf("resolveColumnTypeSyncAction() = %v, want columnTypeSyncActionWarnTextFromVarchar", got)
 	}
 }
@@ -100,34 +100,19 @@ func TestResolveColumnTypeSyncActionTextFromVarcharSupportedModifies(t *testing.
 	features := dialects.ColumnSyncFeatures{TextFromVarchar: true}
 	comparison := typeDiffersComparison(schemas.Text, "VARCHAR(100)", 0, 100)
 
-	if got := resolveColumnTypeSyncAction(nil, features, comparison); got != columnTypeSyncActionModify {
+	if got := resolveColumnTypeSyncAction(features, comparison); got != columnTypeSyncActionModify {
 		t.Fatalf("resolveColumnTypeSyncAction() = %v, want columnTypeSyncActionModify", got)
 	}
 }
 
-func TestResolveColumnTypeSyncActionUnaliasedPrefixMatchStaysSilent(t *testing.T) {
-	// Reproduces v1's default-arm guard: an unaliased struct type "NUMERIC"
-	// against a literal db type "NUMERIC(10,2)" is a byte-for-byte prefix
-	// match, so no warning is produced even though the two rendered types
-	// differ.
-	features := dialects.ColumnSyncFeatures{}
-	comparison := typeDiffersComparison("NUMERIC", "NUMERIC(10,2)", 0, 10)
-
-	if got := resolveColumnTypeSyncAction(nil, features, comparison); got != columnTypeSyncActionNone {
-		t.Fatalf("resolveColumnTypeSyncAction() = %v, want columnTypeSyncActionNone", got)
-	}
-}
-
-// TestResolveColumnTypeSyncActionMySQLNumericPrefixMatchStaysSilent is the
-// real-dialect counterpart of the guard above: mysql aliases "numeric" to
-// "decimal", so CompareColumns reports a bare "NUMERIC" struct column
-// against a literal "NUMERIC(10,2)" db column as ColumnCompareEquivalent
-// (see dialects.TestCompareColumnsMySQLNumericPrefixMismatch, whose
+// TestResolveColumnTypeSyncActionMySQLNumericPrefixMatchStaysSilent pins
+// that a bare "NUMERIC" struct column against a literal "NUMERIC(10,2)" db
+// column stays silent: mysql aliases "numeric" to "decimal", so
+// CompareColumns reports this pair as ColumnCompareEquivalent (see
+// dialects.TestCompareColumnsMySQLNumericPrefixMismatch, whose
 // aliasing-both-sides fix is what makes this Equivalent rather than
-// Different), and resolveColumnTypeSyncAction must still stay silent for
-// it - now via the early "!IsDifferent()" return rather than via
-// columnTypeBaseNameMatchesPrefix, but the resulting action is unchanged
-// either way.
+// Different), and resolveColumnTypeSyncAction stays silent for it via the
+// early "!IsDifferent()" return.
 func TestResolveColumnTypeSyncActionMySQLNumericPrefixMatchStaysSilent(t *testing.T) {
 	dialect := mustInitTestDialect(t, schemas.MYSQL)
 	expect := &schemas.Column{Name: "n", SQLType: schemas.SQLType{Name: schemas.Numeric}}
@@ -139,7 +124,7 @@ func TestResolveColumnTypeSyncActionMySQLNumericPrefixMatchStaysSilent(t *testin
 	}
 
 	features := dialects.ColumnSyncFeatures{TextFromVarchar: true, VarcharLengthChange: true, ColumnComment: true}
-	if got := resolveColumnTypeSyncAction(dialect.Alias, features, comparison); got != columnTypeSyncActionNone {
+	if got := resolveColumnTypeSyncAction(features, comparison); got != columnTypeSyncActionNone {
 		t.Fatalf("resolveColumnTypeSyncAction() = %v, want columnTypeSyncActionNone", got)
 	}
 }
@@ -155,22 +140,14 @@ func TestResolveColumnTypeSyncActionMySQLNumericPrefixMatchStaysSilent(t *testin
 // same way (silent) against a "NUMERIC(10,2)" column, and the two unsized
 // spellings must also agree (silent) against a bare "NUMERIC" column.
 //
-// Before compareColumnTypes' base-name level aliased both sides, only the
-// two bare-vs-sized rows ("decimal_vs_sized_numeric_column" and
-// "numeric_vs_sized_numeric_column") reached columnTypeBaseNameMatchesPrefix:
-// "DECIMAL" (unaliased, already canonical) against aliased actual
-// "NUMERIC(10,2)" -> "DECIMAL(10,2)" never matched at level 4 and fell
-// through to Different, relying on resolveColumnTypeSyncAction's own guard
-// to stay silent; every other row was already Equal or Equivalent before
-// that guard ran.
-//
-// Now that level 4 aliases both sides (see dialects.TestCompareColumnsType's
-// "type aliases still match" case and compareColumnTypes itself), all six
-// rows resolve to Equal or Equivalent at compareColumnTypes and none of them
-// reach columnTypeBaseNameMatchesPrefix any more - reachesGuard is false for
-// every row. The field is kept, with its values updated, so a future change
-// that reopens the gap (and starts relying on the guard again for any of
-// these rows) fails loudly here instead of silently regressing.
+// compareColumnTypes' base-name level (level 4) now aliases both sides (see
+// dialects.TestCompareColumnsType's "type aliases still match" case and
+// compareColumnTypes itself), so every row here resolves to Equal or
+// Equivalent at compareColumnTypes: comparison.Type.IsDifferent() is false
+// for all six, and resolveColumnTypeSyncAction never even reaches its
+// type-mismatch branch. That is asserted directly below so a future change
+// that reopens the single-sided-aliasing gap fails loudly here instead of
+// silently regressing.
 func TestResolveColumnTypeSyncActionPostgresDecimalNumericSynonymsMatchSymmetrically(t *testing.T) {
 	dialect := mustInitTestDialect(t, schemas.POSTGRES)
 	features := dialects.ColumnSyncFeatures{TextFromVarchar: true, VarcharLengthChange: true, ColumnComment: true}
@@ -180,18 +157,13 @@ func TestResolveColumnTypeSyncActionPostgresDecimalNumericSynonymsMatchSymmetric
 		expectedName   string
 		expectedLength int64
 		actualLength   int64
-		// reachesGuard records whether CompareColumns classifies this pair as
-		// Different, meaning resolveColumnTypeSyncAction's
-		// columnTypeBaseNameMatchesPrefix guard would be what silences it.
-		// Every row is false now that level 4 aliases both sides.
-		reachesGuard bool
 	}{
-		{"decimal_vs_sized_numeric_column", schemas.Decimal, 0, 10, false},
-		{"sized_decimal_vs_sized_numeric_column", schemas.Decimal, 10, 10, false},
-		{"numeric_vs_sized_numeric_column", schemas.Numeric, 0, 10, false},
-		{"sized_numeric_vs_sized_numeric_column", schemas.Numeric, 10, 10, false},
-		{"decimal_vs_bare_numeric_column", schemas.Decimal, 0, 0, false},
-		{"numeric_vs_bare_numeric_column", schemas.Numeric, 0, 0, false},
+		{"decimal_vs_sized_numeric_column", schemas.Decimal, 0, 10},
+		{"sized_decimal_vs_sized_numeric_column", schemas.Decimal, 10, 10},
+		{"numeric_vs_sized_numeric_column", schemas.Numeric, 0, 10},
+		{"sized_numeric_vs_sized_numeric_column", schemas.Numeric, 10, 10},
+		{"decimal_vs_bare_numeric_column", schemas.Decimal, 0, 0},
+		{"numeric_vs_bare_numeric_column", schemas.Numeric, 0, 0},
 	}
 
 	for _, tt := range tests {
@@ -208,11 +180,11 @@ func TestResolveColumnTypeSyncActionPostgresDecimalNumericSynonymsMatchSymmetric
 			}
 
 			comparison := dialect.CompareColumns(expect, actual)
-			if comparison.Type.IsDifferent() != tt.reachesGuard {
-				t.Fatalf("comparison.Type.IsDifferent() = %v, want %v (comparison.Type = %+v)",
-					comparison.Type.IsDifferent(), tt.reachesGuard, comparison.Type)
+			if comparison.Type.IsDifferent() {
+				t.Fatalf("comparison.Type.IsDifferent() = true, want false (comparison.Type = %+v)",
+					comparison.Type)
 			}
-			if got := resolveColumnTypeSyncAction(dialect.Alias, features, comparison); got != columnTypeSyncActionNone {
+			if got := resolveColumnTypeSyncAction(features, comparison); got != columnTypeSyncActionNone {
 				t.Fatalf("resolveColumnTypeSyncAction() = %v, want columnTypeSyncActionNone (comparison.Type = %+v)",
 					got, comparison.Type)
 			}
@@ -225,7 +197,7 @@ func TestBuildColumnSyncDecisionCommentIgnoredWhenTypeWarns(t *testing.T) {
 	comparison := typeDiffersComparison("INT", "BIGINT", 0, 0)
 	comparison.Comment = dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.typeAction != columnTypeSyncActionWarn {
 		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionWarn", decision.typeAction)
@@ -240,7 +212,7 @@ func TestBuildColumnSyncDecisionCommentIgnoredWhenTypeModifies(t *testing.T) {
 	comparison := typeDiffersComparison(schemas.Text, "VARCHAR(100)", 0, 100)
 	comparison.Comment = dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.typeAction != columnTypeSyncActionModify {
 		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionModify", decision.typeAction)
@@ -259,7 +231,7 @@ func TestBuildColumnSyncDecisionModifiesCommentWhenTypesMatch(t *testing.T) {
 		Actual:   &schemas.Column{Name: "col"},
 	}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.typeAction != columnTypeSyncActionNone {
 		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
@@ -278,7 +250,7 @@ func TestBuildColumnSyncDecisionIgnoresCommentWithoutFeature(t *testing.T) {
 		Actual:   &schemas.Column{Name: "col"},
 	}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.modifyComment {
 		t.Fatalf("decision.modifyComment = true, want false when the dialect does not support comment sync")
@@ -307,7 +279,7 @@ func TestBuildColumnSyncDecisionCommentSyncRequiresExactTypeMatch(t *testing.T) 
 		Actual:   &schemas.Column{Name: "price", Length: 19, Length2: 4},
 	}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.typeAction != columnTypeSyncActionNone {
 		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
@@ -317,6 +289,40 @@ func TestBuildColumnSyncDecisionCommentSyncRequiresExactTypeMatch(t *testing.T) 
 	}
 	if !decision.commentSkippedTypeMismatch {
 		t.Fatalf("decision.commentSkippedTypeMismatch = false, want true so applyColumnSyncDecision can log the skip")
+	}
+}
+
+// TestBuildColumnSyncDecisionCommentOnlyDialectSyncsEquivalentPair is the
+// positive counterpart of
+// TestBuildColumnSyncDecisionCommentSyncRequiresExactTypeMatch, for a
+// dialect whose ColumnSyncFeatures.ColumnCommentOnly is true: the same
+// Equivalent-but-not-Equal shape (a real NUMERIC(19,4) column against a
+// struct tagged DECIMAL(10,2)) must now sync its comment, because
+// ModifyColumnCommentSQL never renders a type clause at all - so there is
+// nothing for the type text to narrow, unlike the full-rewrite
+// ModifyColumnSQL the Equal-only gate exists to protect.
+func TestBuildColumnSyncDecisionCommentOnlyDialectSyncsEquivalentPair(t *testing.T) {
+	features := dialects.ColumnSyncFeatures{ColumnComment: true, ColumnCommentOnly: true}
+	comparison := dialects.ColumnComparison{
+		Type:     dialects.ColumnCompareField{Status: dialects.ColumnCompareEquivalent, Expected: "DECIMAL(10,2)", Actual: "NUMERIC(19,4)", Reason: "base sql type name"},
+		Comment:  dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"},
+		Expected: &schemas.Column{Name: "price", Length: 10, Length2: 2},
+		Actual:   &schemas.Column{Name: "price", Length: 19, Length2: 4},
+	}
+
+	decision := buildColumnSyncDecision(features, comparison)
+
+	if decision.typeAction != columnTypeSyncActionNone {
+		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
+	}
+	if !decision.modifyComment {
+		t.Fatalf("decision.modifyComment = false, want true: a comment-only dialect must sync an Equivalent-but-not-Equal pair's comment")
+	}
+	if !decision.modifyCommentOnly {
+		t.Fatalf("decision.modifyCommentOnly = false, want true so applyColumnSyncDecision calls ModifyColumnCommentSQL, not ModifyColumnSQL")
+	}
+	if decision.commentSkippedTypeMismatch {
+		t.Fatalf("decision.commentSkippedTypeMismatch = true, want false: the comment-only path has nothing to skip")
 	}
 }
 
@@ -382,7 +388,7 @@ func TestBuildColumnSyncDecisionBareVarcharSuppressesCommentSync(t *testing.T) {
 		Actual:   &schemas.Column{Name: "col", Length: 255},
 	}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.typeAction != columnTypeSyncActionNone {
 		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
@@ -402,7 +408,7 @@ func TestBuildColumnSyncDecisionVarcharShrinkSuppressesCommentSync(t *testing.T)
 	comparison := typeDiffersComparison("VARCHAR(50)", "VARCHAR(100)", 50, 100)
 	comparison.Comment = dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.typeAction != columnTypeSyncActionNone {
 		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
@@ -437,7 +443,7 @@ func TestApplyColumnSyncDecisionBareVarcharRunsNoSQL(t *testing.T) {
 		Expected: &schemas.Column{Name: "col", Length: 0},
 		Actual:   &schemas.Column{Name: "col", Length: 255},
 	}
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if err := applyColumnSyncDecision(session, "tbl", "tbl", comparison, decision); err != nil {
 		t.Fatalf("applyColumnSyncDecision() error = %v", err)
@@ -464,7 +470,7 @@ func TestApplyColumnSyncDecisionVarcharShrinkRunsNoSQL(t *testing.T) {
 	features := dialects.ColumnSyncFeatures{ColumnComment: true, VarcharLengthChange: true}
 	comparison := typeDiffersComparison("VARCHAR(50)", "VARCHAR(100)", 50, 100)
 	comparison.Comment = dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"}
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if err := applyColumnSyncDecision(session, "tbl", "tbl", comparison, decision); err != nil {
 		t.Fatalf("applyColumnSyncDecision() error = %v", err)
@@ -561,7 +567,7 @@ func TestApplyColumnSyncDecisionLogsWhenCommentSyncSkippedForTypeMismatch(t *tes
 		Expected: &schemas.Column{Name: "price", Length: 10, Length2: 2},
 		Actual:   &schemas.Column{Name: "price", Length: 19, Length2: 4},
 	}
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if err := applyColumnSyncDecision(session, "tbl", "tbl", comparison, decision); err != nil {
 		t.Fatalf("applyColumnSyncDecision() error = %v", err)
@@ -653,7 +659,7 @@ func TestBuildColumnSyncDecisionVarcharPairWidens(t *testing.T) {
 	comparison := varcharPairComparison("VARCHAR(255)", "VARCHAR(64)", 255, 64)
 	comparison.Comment = dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.typeAction != columnTypeSyncActionModifyVarcharExpand {
 		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionModifyVarcharExpand", decision.typeAction)
@@ -685,7 +691,7 @@ func TestBuildColumnSyncDecisionVarcharPairFallsThroughToCommentGate(t *testing.
 	comparison := varcharPairComparison("VARCHAR(255)", "VARCHAR(64)", 255, 64)
 	comparison.Comment = dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.typeAction != columnTypeSyncActionNone {
 		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
@@ -713,7 +719,7 @@ func TestBuildColumnSyncDecisionVarcharPairFallsThroughWhenTypesMatchExactly(t *
 		Actual:   &schemas.Column{Name: "col", Length: 255},
 	}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.typeAction != columnTypeSyncActionNone {
 		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
@@ -734,12 +740,177 @@ func TestBuildColumnSyncDecisionBareVarcharTakesPriorityOverSizedPair(t *testing
 	comparison := varcharPairComparison(schemas.Varchar, "VARCHAR(255)", 0, 255)
 	comparison.Comment = dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"}
 
-	decision := buildColumnSyncDecision(nil, features, comparison)
+	decision := buildColumnSyncDecision(features, comparison)
 
 	if decision.typeAction != columnTypeSyncActionNone {
 		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
 	}
 	if decision.modifyComment {
 		t.Fatalf("decision.modifyComment = true, want false: the bare-VARCHAR arm must still suppress comment sync")
+	}
+}
+
+// commentOnlySyncTestDialect wraps a real dialect and reports
+// implements dialects.ColumnCommentModifier, with ModifyColumnSQL and
+// ModifyColumnCommentSQL each rendering a distinct, independently
+// executable CREATE TABLE statement. This lets a test observe which of
+// the two methods applyColumnSyncDecision actually invoked by checking
+// which marker table exists afterwards, rather than by mocking
+// session.exec itself. It deliberately does NOT set ColumnCommentOnly in
+// its Features() override: columnSyncFeaturesFor (sync.go) is supposed to
+// derive that flag from this type actually implementing
+// ModifyColumnCommentSQL, and this test exercises that derivation rather
+// than assuming it.
+type commentOnlySyncTestDialect struct {
+	dialects.Dialect
+}
+
+const (
+	commentOnlySyncTestMarkerFullRewrite = "sync_test_marker_full_rewrite"
+	commentOnlySyncTestMarkerCommentOnly = "sync_test_marker_comment_only"
+)
+
+func (d *commentOnlySyncTestDialect) Features() *dialects.DialectFeatures {
+	features := *d.Dialect.Features()
+	features.ColumnSync.ColumnComment = true
+	return &features
+}
+
+func (d *commentOnlySyncTestDialect) ModifyColumnSQL(tableName string, col *schemas.Column) string {
+	return "CREATE TABLE " + commentOnlySyncTestMarkerFullRewrite + " (x INTEGER)"
+}
+
+func (d *commentOnlySyncTestDialect) ModifyColumnCommentSQL(tableName string, col *schemas.Column) string {
+	return "CREATE TABLE " + commentOnlySyncTestMarkerCommentOnly + " (x INTEGER)"
+}
+
+// TestApplyColumnSyncDecisionUsesCommentOnlyDDLWhenAvailable is the
+// executed-path counterpart of
+// TestBuildColumnSyncDecisionCommentOnlyDialectSyncsEquivalentPair: for a
+// decision resolved through a comment-only dialect,
+// applyColumnSyncDecision must run ModifyColumnCommentSQL's statement and
+// must never run ModifyColumnSQL's, confirmed against a real (temp-file)
+// sqlite3 database rather than through a side channel.
+func TestApplyColumnSyncDecisionUsesCommentOnlyDDLWhenAvailable(t *testing.T) {
+	engine, err := NewEngine("sqlite3", filepath.Join(t.TempDir(), "sync-comment-only.db"))
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	defer engine.Close()
+
+	engine.dialect = &commentOnlySyncTestDialect{Dialect: engine.dialect}
+
+	features := columnSyncFeaturesFor(engine.dialect)
+	if !features.ColumnCommentOnly {
+		t.Fatalf("columnSyncFeaturesFor(engine.dialect).ColumnCommentOnly = false, want true: engine.dialect implements dialects.ColumnCommentModifier")
+	}
+	comparison := dialects.ColumnComparison{
+		Type:     dialects.ColumnCompareField{Status: dialects.ColumnCompareEquivalent, Expected: "INT", Actual: "INT(11)", Reason: "normalized sql type"},
+		Comment:  dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"},
+		Expected: &schemas.Column{Name: "col"},
+		Actual:   &schemas.Column{Name: "col"},
+	}
+	decision := buildColumnSyncDecision(features, comparison)
+	if !decision.modifyComment || !decision.modifyCommentOnly {
+		t.Fatalf("decision = %+v, want modifyComment && modifyCommentOnly", decision)
+	}
+
+	session := engine.NewSession()
+	defer session.Close()
+
+	if err := applyColumnSyncDecision(session, "tbl", "tbl", comparison, decision); err != nil {
+		t.Fatalf("applyColumnSyncDecision() error = %v", err)
+	}
+
+	commentOnlyExists, err := engine.IsTableExist(commentOnlySyncTestMarkerCommentOnly)
+	if err != nil {
+		t.Fatalf("IsTableExist(%q) error = %v", commentOnlySyncTestMarkerCommentOnly, err)
+	}
+	if !commentOnlyExists {
+		t.Fatalf("expected %q to exist: applyColumnSyncDecision must run ModifyColumnCommentSQL's statement", commentOnlySyncTestMarkerCommentOnly)
+	}
+
+	fullRewriteExists, err := engine.IsTableExist(commentOnlySyncTestMarkerFullRewrite)
+	if err != nil {
+		t.Fatalf("IsTableExist(%q) error = %v", commentOnlySyncTestMarkerFullRewrite, err)
+	}
+	if fullRewriteExists {
+		t.Fatalf("expected %q to not exist: applyColumnSyncDecision must not run ModifyColumnSQL's statement for a comment-only decision", commentOnlySyncTestMarkerFullRewrite)
+	}
+}
+
+// TestColumnSyncFeaturesForDerivesColumnCommentOnly pins the fix for the
+// flag/implementation split found in review: ColumnSyncFeatures.ColumnCommentOnly
+// must never be a hand-set literal a real dialect's Features() method can
+// get wrong or forget; columnSyncFeaturesFor is the single place that
+// sets it, and it does so purely from whether the dialect implements
+// dialects.ColumnCommentModifier - so the flag and the capability are the
+// same fact, checked twice (once here, once in applyColumnSyncDecision)
+// but never able to disagree.
+func TestColumnSyncFeaturesForDerivesColumnCommentOnly(t *testing.T) {
+	sqliteDialect, err := dialects.OpenDialect("sqlite3", "file:test.db?mode=memory")
+	if err != nil {
+		t.Fatalf("OpenDialect(sqlite3) error = %v", err)
+	}
+	if _, ok := sqliteDialect.(dialects.ColumnCommentModifier); ok {
+		t.Fatalf("sanity: sqlite3 must not implement dialects.ColumnCommentModifier")
+	}
+	if got := columnSyncFeaturesFor(sqliteDialect).ColumnCommentOnly; got {
+		t.Fatalf("columnSyncFeaturesFor(sqlite3).ColumnCommentOnly = true, want false")
+	}
+
+	wrapped := &commentOnlySyncTestDialect{Dialect: sqliteDialect}
+	if _, ok := dialects.Dialect(wrapped).(dialects.ColumnCommentModifier); !ok {
+		t.Fatalf("sanity: commentOnlySyncTestDialect must implement dialects.ColumnCommentModifier")
+	}
+	if got := columnSyncFeaturesFor(wrapped).ColumnCommentOnly; !got {
+		t.Fatalf("columnSyncFeaturesFor(wrapped).ColumnCommentOnly = false, want true")
+	}
+}
+
+// commentOnlyClaimDialect claims (via decision.modifyCommentOnly) that a
+// comment-only sync is available without implementing
+// dialects.ColumnCommentModifier - the shape a hand-built
+// columnSyncDecision (as tests elsewhere in this file build) could
+// produce by mistake, or that a future bug in columnSyncFeaturesFor could
+// produce.
+type commentOnlyClaimDialect struct {
+	dialects.Dialect
+}
+
+// TestApplyColumnSyncDecisionFailsLoudlyWhenCommentOnlyDialectMismatch
+// pins the defensive branch in applyColumnSyncDecision: if
+// decision.modifyCommentOnly is true but the dialect does not actually
+// implement dialects.ColumnCommentModifier, applyColumnSyncDecision must
+// return an error and must not fall back to ModifyColumnSQL's full
+// rewrite - falling back silently would reintroduce exactly the
+// type-rewriting side effect this whole comment-only path exists to
+// prevent.
+func TestApplyColumnSyncDecisionFailsLoudlyWhenCommentOnlyDialectMismatch(t *testing.T) {
+	engine, err := NewEngine("sqlite3", filepath.Join(t.TempDir(), "sync-comment-only-mismatch.db"))
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	defer engine.Close()
+
+	engine.dialect = &commentOnlyClaimDialect{Dialect: engine.dialect}
+	if _, ok := engine.dialect.(dialects.ColumnCommentModifier); ok {
+		t.Fatalf("sanity: commentOnlyClaimDialect must not implement dialects.ColumnCommentModifier")
+	}
+
+	comparison := dialects.ColumnComparison{
+		Type:     dialects.ColumnCompareField{Status: dialects.ColumnCompareEquivalent, Expected: "INT", Actual: "INT(11)"},
+		Comment:  dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"},
+		Expected: &schemas.Column{Name: "col"},
+		Actual:   &schemas.Column{Name: "col"},
+	}
+	decision := columnSyncDecision{modifyComment: true, modifyCommentOnly: true}
+
+	session := engine.NewSession()
+	defer session.Close()
+
+	err = applyColumnSyncDecision(session, "tbl", "tbl", comparison, decision)
+	if err == nil {
+		t.Fatalf("applyColumnSyncDecision() error = nil, want an error: the dialect does not implement dialects.ColumnCommentModifier")
 	}
 }

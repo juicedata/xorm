@@ -1042,15 +1042,96 @@ func (db *postgres) ModifyColumnSQL(tableName string, col *schemas.Column) strin
 	quoter := db.dialect.Quoter()
 	commentSQL := "; "
 
+	sqlType := db.alterColumnTypeSQL(col)
+
 	if len(db.getSchema()) == 0 || strings.Contains(tableName, ".") {
-		modifyColumnSQL := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s", quoter.Quote(tableName), quoter.Quote(col.Name), db.SQLType(col))
+		modifyColumnSQL := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s", quoter.Quote(tableName), quoter.Quote(col.Name), sqlType)
 		commentSQL += fmt.Sprintf("COMMENT ON COLUMN %s.%s IS '%s'", quoter.Quote(tableName), quoter.Quote(col.Name), col.Comment)
 		return modifyColumnSQL + commentSQL
 	}
 
-	modifyColumnSQL := fmt.Sprintf("ALTER TABLE %s.%s ALTER COLUMN %s TYPE %s", quoter.Quote(db.getSchema()), quoter.Quote(tableName), quoter.Quote(col.Name), db.SQLType(col))
+	modifyColumnSQL := fmt.Sprintf("ALTER TABLE %s.%s ALTER COLUMN %s TYPE %s", quoter.Quote(db.getSchema()), quoter.Quote(tableName), quoter.Quote(col.Name), sqlType)
 	commentSQL += fmt.Sprintf("COMMENT ON COLUMN %s.%s.%s IS '%s'", quoter.Quote(db.getSchema()), quoter.Quote(tableName), quoter.Quote(col.Name), col.Comment)
 	return modifyColumnSQL + commentSQL
+}
+
+// ModifyColumnCommentSQL returns a standalone "COMMENT ON COLUMN ..."
+// statement, with no "ALTER TABLE ... ALTER COLUMN ... TYPE" clause at
+// all - unlike ModifyColumnSQL, whose comment sync always rides along
+// with a type change. Implementing this method is what makes postgres
+// satisfy dialects.ColumnCommentModifier, which Sync's column loop
+// type-asserts for and uses to set ColumnSyncFeatures.ColumnCommentOnly,
+// so that flag and this method cannot disagree. Sync then calls this for
+// a comment-only difference, so that path can never rewrite the column's
+// type as a side effect - not even a type that happens to render
+// identically, which is what closes xorm/xorm#2594's residual hole: a
+// real SMALLINT column backed by nextval(...) renders "SERIAL" through
+// SQLType's default arm, the same as a real integer-backed serial
+// column, so the pair is ColumnCompareEqual and alterColumnTypeSQL would
+// map it to "INTEGER" - genuinely widening the column - if
+// ModifyColumnSQL's ALTER COLUMN ... TYPE clause were ever reissued for a
+// comment-only sync.
+func (db *postgres) ModifyColumnCommentSQL(tableName string, col *schemas.Column) string {
+	quoter := db.dialect.Quoter()
+
+	if len(db.getSchema()) == 0 || strings.Contains(tableName, ".") {
+		return fmt.Sprintf("COMMENT ON COLUMN %s.%s IS '%s'", quoter.Quote(tableName), quoter.Quote(col.Name), col.Comment)
+	}
+
+	return fmt.Sprintf("COMMENT ON COLUMN %s.%s.%s IS '%s'", quoter.Quote(db.getSchema()), quoter.Quote(tableName), quoter.Quote(col.Name), col.Comment)
+}
+
+// postgresSmallSerial is SQLType's would-be rendering of an autoincrement
+// SMALLINT column. postgres.SQLType has no case for schemas.SmallInt, so it
+// never actually produces this string today (it falls through to the
+// default arm and renders schemas.Serial instead) - this entry is kept so
+// alterColumnPseudoTypes stays correct if that gap is ever closed.
+const postgresSmallSerial = "SMALLSERIAL"
+
+// alterColumnPseudoTypes maps each CREATE TABLE-only serial pseudo-type name
+// SQLType can render to its concrete PostgreSQL type. The mapping is exact -
+// SERIAL/BIGSERIAL/SMALLSERIAL each describe exactly INTEGER/BIGINT/SMALLINT
+// in PostgreSQL - so substituting it can never narrow or widen the column
+// ALTER TABLE ... ALTER COLUMN ... TYPE targets.
+var alterColumnPseudoTypes = map[string]string{
+	schemas.Serial:      schemas.Integer,
+	schemas.BigSerial:   schemas.BigInt,
+	postgresSmallSerial: schemas.SmallInt,
+}
+
+// alterColumnTypeSQL returns the type name to use in ALTER TABLE ... ALTER
+// COLUMN ... TYPE. SQLType renders a serial pseudo-type (SERIAL/BIGSERIAL,
+// and would render SMALLSERIAL if it had a case for it) whenever the column
+// is autoincrement, since that is correct for CREATE TABLE - but those are
+// CREATE TABLE-only pseudo-types PostgreSQL rejects here with "type ... does
+// not exist" (xorm/xorm#2594). This substitutes the concrete underlying type
+// by name, on whatever string SQLType actually produced, rather than
+// re-deriving the type from a modified column: resolveCommentSyncDecision
+// (sync.go) only reaches ModifyColumnSQL when comparison.Type.Status is
+// ColumnCompareEqual, which holds because both sides render identically
+// through SQLType; rendering from a different input here (e.g. a copy with
+// IsAutoIncrement cleared) can silently pick a different-and-narrower type
+// for any column whose autoincrement rendering falls through to a case
+// other than the exact BigInt/Integer -> BigSerial/Serial pair - for
+// example xorm:"SMALLINT pk autoincr" renders as SERIAL (postgres.SQLType's
+// default arm), and re-deriving from a non-autoincrement SMALLINT copy
+// would ALTER a real integer-backed serial column down to smallint.
+//
+// Sync itself no longer reaches this substitution through a comment-only
+// difference: that path now goes through ModifyColumnCommentSQL instead,
+// which never renders a TYPE clause at all, so a comment sync cannot
+// reach ModifyColumnSQL's autoincrement handling any more (Sync only
+// still reaches ModifyColumnSQL for a genuine TEXT/VARCHAR type action).
+// This substitution stays, and stays unit-pinned in postgres_test.go,
+// because ModifyColumnSQL is exported through the Dialect interface and
+// still needs to render legal ALTER ... TYPE SQL for any caller that
+// invokes it directly outside of Sync.
+func (db *postgres) alterColumnTypeSQL(col *schemas.Column) string {
+	sqlType := db.SQLType(col)
+	if concrete, ok := alterColumnPseudoTypes[sqlType]; ok {
+		return concrete
+	}
+	return sqlType
 }
 
 func (db *postgres) DropIndexSQL(tableName string, index *schemas.Index) string {
