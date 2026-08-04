@@ -31,3 +31,28 @@ func TestParseMSSQL(t *testing.T) {
 		}
 	}
 }
+
+// TestMssqlAliasNumericToDecimal pins mssql's Alias mapping, which mirrors
+// the one postgres already has: DECIMAL and NUMERIC are exact synonyms in
+// SQL Server, so CompareColumns' base-name level (dialects/compare.go)
+// must treat them as the same type regardless of which spelling the
+// database reports or the struct tag uses.
+func TestMssqlAliasNumericToDecimal(t *testing.T) {
+	db := &mssql{}
+
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"numeric", "decimal"},
+		{"NUMERIC", "decimal"},
+		{"decimal", "decimal"},
+		{"varchar", "varchar"},
+	}
+
+	for _, tt := range tests {
+		if got := db.Alias(tt.in); got != tt.want {
+			t.Errorf("Alias(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}

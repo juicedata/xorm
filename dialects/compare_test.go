@@ -534,13 +534,20 @@ func TestCompareColumnsPostgresSerialNullable(t *testing.T) {
 	}
 }
 
-// TestCompareColumnsMySQLNumericPrefixMismatch is the real-dialect
-// counterpart of the "unaliased NUMERIC struct type" default-arm guard in
-// package xorm's resolveColumnTypeSyncAction: mysql aliases "numeric" to
-// "decimal", so a bare "NUMERIC" struct type and a literal "NUMERIC(10,2)"
-// db type fail both the normalized-type (level 3) and base-name (level 4)
-// checks and are correctly reported as Different here; the sync policy
-// layer is responsible for silencing the resulting warning.
+// TestCompareColumnsMySQLNumericPrefixMismatch pins compareColumnTypes's
+// base-name level (level 4) aliasing both expectedType and actualType
+// before comparing them: a bare "NUMERIC" struct type against a literal
+// "NUMERIC(10,2)" db type both alias to "DECIMAL" on mysql, so this pair
+// is ColumnCompareEquivalent, not Different. Before that level aliased
+// both sides, it aliased only the expected side, so alias("NUMERIC") =
+// "DECIMAL" was compared against the actual side's un-aliased "NUMERIC"
+// and never matched - a bare "NUMERIC" struct type against a literal
+// "NUMERIC(10,2)" db type was reported Different here even though it
+// renders identically to the equivalent "DECIMAL" spelling, and only
+// stayed silent because resolveColumnTypeSyncAction's own
+// columnTypeBaseNameMatchesPrefix guard rescued it a second time. See
+// TestResolveColumnTypeSyncActionMySQLNumericPrefixMatchStaysSilent for
+// confirmation that the resulting sync action is unchanged.
 func TestCompareColumnsMySQLNumericPrefixMismatch(t *testing.T) {
 	dialect := mustInitDialect(t, schemas.MYSQL)
 	expect := &schemas.Column{Name: "n", SQLType: schemas.SQLType{Name: schemas.Numeric}}
@@ -548,8 +555,8 @@ func TestCompareColumnsMySQLNumericPrefixMismatch(t *testing.T) {
 
 	comparison := dialect.CompareColumns(expect, actual)
 
-	if comparison.Type.Status != ColumnCompareDifferent {
-		t.Fatalf("comparison.Type.Status = %v, want ColumnCompareDifferent", comparison.Type.Status)
+	if comparison.Type.Status != ColumnCompareEquivalent {
+		t.Fatalf("comparison.Type.Status = %v, want ColumnCompareEquivalent", comparison.Type.Status)
 	}
 	if comparison.Type.Expected != "NUMERIC" || comparison.Type.Actual != "NUMERIC(10,2)" {
 		t.Fatalf("comparison.Type = %q/%q, want NUMERIC/NUMERIC(10,2)", comparison.Type.Expected, comparison.Type.Actual)

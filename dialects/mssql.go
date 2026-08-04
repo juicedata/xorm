@@ -211,6 +211,13 @@ var (
 		Suffix:     ']',
 		IsReserved: schemas.AlwaysReserve,
 	}
+
+	// mssqlColAliases maps a database-reported type name to the name xorm's
+	// own tag vocabulary uses, so CompareColumns treats DECIMAL and NUMERIC
+	// as the same type even though SQL Server reports NUMERIC verbatim.
+	mssqlColAliases = map[string]string{
+		"numeric": "decimal",
+	}
 )
 
 type mssql struct {
@@ -218,6 +225,15 @@ type mssql struct {
 	defaultVarchar string
 	defaultChar    string
 	useLegacy      bool
+}
+
+// Alias returns a alias of column
+func (db *mssql) Alias(col string) string {
+	v, ok := mssqlColAliases[strings.ToLower(col)]
+	if ok {
+		return v
+	}
+	return col
 }
 
 func (db *mssql) Init(uri *URI) error {
@@ -461,7 +477,7 @@ func (db *mssql) GetColumns(queryer core.Queryer, ctx context.Context, tableName
 		  "default_is_null" = (CASE WHEN c.text is null THEN 1 ELSE 0 END),
 	      replace(replace(isnull(c.text,''),'(',''),')','') as vdefault,
 		  ISNULL(p.is_primary_key, 0), a.is_identity as is_identity, a.collation_name
-          from sys.columns a 
+          from sys.columns a
 		  left join sys.types b on a.user_type_id=b.user_type_id
           left join sys.syscomments c on a.default_object_id=c.id
 		  LEFT OUTER JOIN (SELECT i.object_id, ic.column_id, i.is_primary_key
@@ -500,7 +516,7 @@ func (db *mssql) GetColumns(queryer core.Queryer, ctx context.Context, tableName
 		col.IsPrimaryKey = isPK
 		col.IsAutoIncrement = isIncrement
 		ct := strings.ToUpper(ctype)
-		if ct == "DECIMAL" {
+		if ct == "DECIMAL" || ct == "NUMERIC" {
 			col.Length = precision
 			col.Length2 = scale
 		} else {

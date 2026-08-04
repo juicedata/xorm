@@ -765,6 +765,165 @@ func TestSyncWarningMySQLDecimalCommentDoesNotNarrowColumn(t *testing.T) {
 		"expected the stored value to survive Sync without being rounded to the struct tag's narrower scale")
 }
 
+type syncWarningPostgresDecimal1010_2 struct {
+	Id    int64   `xorm:"pk"`
+	Price float64 `xorm:"DECIMAL(10,2) NOT NULL"`
+}
+
+type syncWarningPostgresNumeric1010_2 struct {
+	Id    int64   `xorm:"pk"`
+	Price float64 `xorm:"NUMERIC(10,2) NOT NULL"`
+}
+
+type syncWarningPostgresDecimal19_4 struct {
+	Id    int64   `xorm:"pk"`
+	Price float64 `xorm:"DECIMAL(19,4) NOT NULL"`
+}
+
+type syncWarningPostgresNumeric19_4 struct {
+	Id    int64   `xorm:"pk"`
+	Price float64 `xorm:"NUMERIC(19,4) NOT NULL"`
+}
+
+// TestSyncWarningPostgresNumericDecimalSynonymsMatchSymmetrically is the
+// live-database counterpart of
+// TestResolveColumnTypeSyncActionPostgresDecimalNumericSynonymsMatchSymmetrically
+// in package xorm: postgres's own "numeric" -> "decimal" Alias mapping
+// only silenced compareColumnTypes's base-name level when applying it to
+// the expected side happened to line up with the actual side's raw,
+// unaliased spelling. Before compareColumnTypes aliased both sides, a
+// real postgres NUMERIC(10,2) column warned against a struct tagged
+// "DECIMAL(19,4)" or "NUMERIC(19,4)" (a genuine precision mismatch
+// postgres cannot ALTER away during Sync, but one that the analogous
+// "DECIMAL(19,4)" pair already stayed silent for - see
+// dialects.TestCompareColumnsType's "type aliases still match" case), and
+// a bare NUMERIC column warned against every sized tag spelling, while
+// the same pairs against a "DECIMAL(10,2)" or exactly-matching
+// "NUMERIC(10,2)" tag stayed silent. All eight combinations must resolve
+// the same way (silent) regardless of which synonym spelling was used.
+func TestSyncWarningPostgresNumericDecimalSynonymsMatchSymmetrically(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.POSTGRES {
+		t.Skip("postgres only")
+	}
+
+	tests := []struct {
+		name      string
+		tableName string
+		columnDDL string
+		sync      func(tableName string) error
+	}{
+		{"decimal_10_2_vs_sized_10_2", "swp_num_sym_1", "NUMERIC(10,2)", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(syncWarningPostgresDecimal1010_2))
+		}},
+		{"numeric_10_2_vs_sized_10_2", "swp_num_sym_2", "NUMERIC(10,2)", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(syncWarningPostgresNumeric1010_2))
+		}},
+		{"decimal_19_4_vs_sized_10_2", "swp_num_sym_3", "NUMERIC(10,2)", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(syncWarningPostgresDecimal19_4))
+		}},
+		{"numeric_19_4_vs_sized_10_2", "swp_num_sym_4", "NUMERIC(10,2)", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(syncWarningPostgresNumeric19_4))
+		}},
+		{"decimal_10_2_vs_bare", "swp_num_sym_5", "NUMERIC", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(syncWarningPostgresDecimal1010_2))
+		}},
+		{"numeric_10_2_vs_bare", "swp_num_sym_6", "NUMERIC", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(syncWarningPostgresNumeric1010_2))
+		}},
+		{"decimal_19_4_vs_bare", "swp_num_sym_7", "NUMERIC", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(syncWarningPostgresDecimal19_4))
+		}},
+		{"numeric_19_4_vs_bare", "swp_num_sym_8", "NUMERIC", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(syncWarningPostgresNumeric19_4))
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tableName := tt.tableName
+			dropTestTable(tableName)
+			defer dropTestTable(tableName)
+
+			_, err := testEngine.Exec(fmt.Sprintf(
+				"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, price %s NOT NULL)",
+				qualifiedTableName(tableName), tt.columnDDL))
+			assert.NoError(t, err)
+			assertTableVisible(t, tableName)
+
+			before := columnFromDBMetas(t, tableName, "price")
+
+			recorder := captureWarnings(t)
+			assert.NoError(t, tt.sync(tableName))
+			assert.False(t, recorder.hasMessageContaining("column price db type is"),
+				"expected no warning about price, got: %v", recorder.messages())
+
+			after := columnFromDBMetas(t, tableName, "price")
+			assert.EqualValues(t, before.Length, after.Length,
+				"expected Sync to leave the column's precision unchanged regardless of synonym spelling or declared precision")
+			assert.EqualValues(t, before.Length2, after.Length2,
+				"expected Sync to leave the column's scale unchanged regardless of synonym spelling or declared precision")
+		})
+	}
+}
+
+// TestSyncWarningPostgresNumericCommentSyncDoesNotNarrowColumn is the
+// postgres counterpart of TestSyncWarningMySQLDecimalCommentDoesNotNarrowColumn,
+// pinning the interaction between this change's level-4 aliasing fix and
+// xorm/xorm#2591's comment gate: once compareColumnTypes' base-name level
+// aliases both sides, a real postgres NUMERIC(19,4) column against a
+// struct tagged DECIMAL(10,2) is ColumnCompareEquivalent, not Different,
+// so it falls through buildColumnSyncDecision's first two switch cases to
+// the comment case - and resolveCommentSyncDecision must refuse the
+// comment sync there, or applyColumnSyncDecision's ModifyColumnSQL call
+// would narrow the column and round the stored value as a side effect of
+// "just" syncing the comment.
+func TestSyncWarningPostgresNumericCommentSyncDoesNotNarrowColumn(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.POSTGRES {
+		t.Skip("postgres only")
+	}
+
+	const tableName = "sync_warning_postgres_numeric_comment_no_narrow"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, price NUMERIC(19,4))", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	_, err = testEngine.Exec(fmt.Sprintf(
+		"INSERT INTO %s (id, price) VALUES (1, 1.2345)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	_, err = testEngine.Exec(fmt.Sprintf(
+		"COMMENT ON COLUMN %s.price IS 'old comment'", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	before := columnFromDBMetas(t, tableName, "price")
+	assert.EqualValues(t, 19, before.Length, "sanity: numeric(19,4) column should read back with precision 19")
+	assert.EqualValues(t, 4, before.Length2, "sanity: numeric(19,4) column should read back with scale 4")
+
+	type SyncWarningPostgresNumericCommentNoNarrow struct {
+		Id    int64   `xorm:"pk"`
+		Price float64 `xorm:"DECIMAL(10,2) comment('new comment')"`
+	}
+
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningPostgresNumericCommentNoNarrow)))
+
+	after := columnFromDBMetas(t, tableName, "price")
+	assert.EqualValues(t, 19, after.Length,
+		"expected Sync to leave the numeric(19,4) column's precision unchanged even though its comment differs from the struct tag")
+	assert.EqualValues(t, 4, after.Length2,
+		"expected Sync to leave the numeric(19,4) column's scale unchanged even though its comment differs from the struct tag")
+
+	var price float64
+	has, err := testEngine.Table(tableName).Cols("price").Where("id = ?", 1).Get(&price)
+	assert.NoError(t, err)
+	assert.True(t, has)
+	assert.InDelta(t, 1.2345, price, 0.00001,
+		"expected the stored value to survive Sync without being rounded to the struct tag's narrower scale")
+}
+
 // TestSyncWarningVarcharShrinkWithCommentDoesNotNarrowColumn is the P1
 // composition regression from review of xorm/xorm#2588/#2589/#2591: a
 // database VARCHAR(255) column against a struct wanting VARCHAR(64), with
@@ -1169,4 +1328,185 @@ func TestSyncWarningVarcharWidenTakesPriorityOverCommentSync(t *testing.T) {
 		"expected lower_name to widen from VARCHAR(64) to VARCHAR(255)")
 	assert.Equal(t, "new comment", col.Comment,
 		"expected the comment to sync as part of the widen's own ModifyColumnSQL, which renders the full expected column")
+}
+
+// TestSyncWarningMSSQLNumericPrecisionReadBack is the xorm/xorm#2589
+// fix: GetColumns special-cased ct == "DECIMAL" when populating
+// Length/Length2 from sys.columns' precision/scale; a real NUMERIC(10,2)
+// column fell through to the generic max_length byte-count path instead,
+// so it read back as NUMERIC(9) with the scale lost, and Sync warned
+// forever against a struct field tagged DECIMAL(10,2).
+func TestSyncWarningMSSQLNumericPrecisionReadBack(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.MSSQL {
+		t.Skip("mssql only")
+	}
+
+	const tableName = "sync_warning_mssql_numeric_precision_readback"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, price NUMERIC(10,2) NOT NULL)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	before := columnFromDBMetas(t, tableName, "price")
+	assert.EqualValues(t, 10, before.Length, "sanity: numeric(10,2) column should read back with precision 10")
+	assert.EqualValues(t, 2, before.Length2, "sanity: numeric(10,2) column should read back with scale 2")
+
+	type SyncWarningMSSQLNumericPrecisionReadBack struct {
+		Id    int64   `xorm:"pk"`
+		Price float64 `xorm:"DECIMAL(10,2) NOT NULL"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningMSSQLNumericPrecisionReadBack)))
+	assert.False(t, recorder.hasMessageContaining("column price db type is"),
+		"expected no warning about price, got: %v", recorder.messages())
+}
+
+// TestSyncWarningMSSQLNumericDecimalSynonymsMatchSymmetrically is the
+// live-database counterpart of
+// TestResolveColumnTypeSyncActionPostgresDecimalNumericSynonymsMatchSymmetrically,
+// on mssql: DECIMAL and NUMERIC are exact synonyms in SQL Server, and all
+// eight combinations of struct tag spelling/precision against a sized or
+// bare NUMERIC column must resolve the same way (silent), regardless of
+// which synonym spelling was used.
+func TestSyncWarningMSSQLNumericDecimalSynonymsMatchSymmetrically(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.MSSQL {
+		t.Skip("mssql only")
+	}
+
+	type mssqlDecimal1010_2 struct {
+		Id    int64   `xorm:"pk"`
+		Price float64 `xorm:"DECIMAL(10,2) NOT NULL"`
+	}
+	type mssqlNumeric1010_2 struct {
+		Id    int64   `xorm:"pk"`
+		Price float64 `xorm:"NUMERIC(10,2) NOT NULL"`
+	}
+	type mssqlDecimal19_4 struct {
+		Id    int64   `xorm:"pk"`
+		Price float64 `xorm:"DECIMAL(19,4) NOT NULL"`
+	}
+	type mssqlNumeric19_4 struct {
+		Id    int64   `xorm:"pk"`
+		Price float64 `xorm:"NUMERIC(19,4) NOT NULL"`
+	}
+
+	tests := []struct {
+		name      string
+		tableName string
+		columnDDL string
+		sync      func(tableName string) error
+	}{
+		{"decimal_10_2_vs_sized_10_2", "swm_num_sym_1", "NUMERIC(10,2)", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(mssqlDecimal1010_2))
+		}},
+		{"numeric_10_2_vs_sized_10_2", "swm_num_sym_2", "NUMERIC(10,2)", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(mssqlNumeric1010_2))
+		}},
+		{"decimal_19_4_vs_sized_10_2", "swm_num_sym_3", "NUMERIC(10,2)", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(mssqlDecimal19_4))
+		}},
+		{"numeric_19_4_vs_sized_10_2", "swm_num_sym_4", "NUMERIC(10,2)", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(mssqlNumeric19_4))
+		}},
+		{"decimal_10_2_vs_bare", "swm_num_sym_5", "NUMERIC", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(mssqlDecimal1010_2))
+		}},
+		{"numeric_10_2_vs_bare", "swm_num_sym_6", "NUMERIC", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(mssqlNumeric1010_2))
+		}},
+		{"decimal_19_4_vs_bare", "swm_num_sym_7", "NUMERIC", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(mssqlDecimal19_4))
+		}},
+		{"numeric_19_4_vs_bare", "swm_num_sym_8", "NUMERIC", func(tableName string) error {
+			return testEngine.Table(tableName).Sync(new(mssqlNumeric19_4))
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tableName := tt.tableName
+			dropTestTable(tableName)
+			defer dropTestTable(tableName)
+
+			_, err := testEngine.Exec(fmt.Sprintf(
+				"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, price %s NOT NULL)",
+				qualifiedTableName(tableName), tt.columnDDL))
+			assert.NoError(t, err)
+			assertTableVisible(t, tableName)
+
+			before := columnFromDBMetas(t, tableName, "price")
+
+			recorder := captureWarnings(t)
+			assert.NoError(t, tt.sync(tableName))
+			assert.False(t, recorder.hasMessageContaining("column price db type is"),
+				"expected no warning about price, got: %v", recorder.messages())
+
+			after := columnFromDBMetas(t, tableName, "price")
+			assert.EqualValues(t, before.Length, after.Length,
+				"expected Sync to leave the column's precision unchanged regardless of synonym spelling or declared precision")
+			assert.EqualValues(t, before.Length2, after.Length2,
+				"expected Sync to leave the column's scale unchanged regardless of synonym spelling or declared precision")
+		})
+	}
+}
+
+// TestSyncWarningMSSQLNumericCommentSyncDoesNotNarrowColumn is the mssql
+// counterpart of TestSyncWarningMySQLDecimalCommentDoesNotNarrowColumn: a
+// real NUMERIC(19,4) column against a struct tagged DECIMAL(10,2), which
+// compareColumnTypes' base-name level now (correctly) treats as the same
+// base type after this change, is ColumnCompareEquivalent, not Equal, so
+// resolveCommentSyncDecision (xorm/xorm#2591) must refuse the comment
+// sync rather than let ModifyColumnSQL narrow the column. mssql's own
+// ColumnSyncFeatures never enables ColumnComment, so this is a defensive
+// pin rather than a reachable-in-production shape, and the column has no
+// comment to compare against in the first place - the assertion that
+// matters here is that Sync leaves precision, scale, and the stored value
+// untouched.
+func TestSyncWarningMSSQLNumericCommentSyncDoesNotNarrowColumn(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.MSSQL {
+		t.Skip("mssql only")
+	}
+
+	const tableName = "sync_warning_mssql_numeric_comment_no_narrow"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, price NUMERIC(19,4))", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	_, err = testEngine.Exec(fmt.Sprintf(
+		"INSERT INTO %s (id, price) VALUES (1, 1.2345)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	before := columnFromDBMetas(t, tableName, "price")
+	assert.EqualValues(t, 19, before.Length, "sanity: numeric(19,4) column should read back with precision 19")
+	assert.EqualValues(t, 4, before.Length2, "sanity: numeric(19,4) column should read back with scale 4")
+
+	type SyncWarningMSSQLNumericCommentNoNarrow struct {
+		Id    int64   `xorm:"pk"`
+		Price float64 `xorm:"DECIMAL(10,2) comment('new comment')"`
+	}
+
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningMSSQLNumericCommentNoNarrow)))
+
+	after := columnFromDBMetas(t, tableName, "price")
+	assert.EqualValues(t, 19, after.Length,
+		"expected Sync to leave the numeric(19,4) column's precision unchanged even though its comment differs from the struct tag")
+	assert.EqualValues(t, 4, after.Length2,
+		"expected Sync to leave the numeric(19,4) column's scale unchanged even though its comment differs from the struct tag")
+
+	var price float64
+	has, err := testEngine.Table(tableName).Cols("price").Where("id = ?", 1).Get(&price)
+	assert.NoError(t, err)
+	assert.True(t, has)
+	assert.InDelta(t, 1.2345, price, 0.00001,
+		"expected the stored value to survive Sync without being rounded to the struct tag's narrower scale")
 }

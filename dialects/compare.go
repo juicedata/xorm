@@ -120,7 +120,14 @@ func compareColumnTypes(alias func(string) string, expected, actual *schemas.Col
 		return field.withStatus(ColumnCompareEquivalent, "normalized sql type")
 	}
 
-	if strings.EqualFold(schemas.SQLTypeName(actualType), alias(schemas.SQLTypeName(expectedType))) {
+	// Alias both sides here, not just expectedType: a dialect's synonym map
+	// only records one canonical direction (e.g. mssql/mysql/postgres all
+	// alias "numeric" onto "decimal", never the reverse), so aliasing only
+	// one side can turn a genuine match into a spurious mismatch whenever
+	// the unaliased side is the one already holding the canonical name -
+	// see xorm/xorm#2589's review. Aliasing must be idempotent here: it may
+	// only ever turn a mismatch into a match, never the other way round.
+	if strings.EqualFold(alias(schemas.SQLTypeName(actualType)), alias(schemas.SQLTypeName(expectedType))) {
 		return field.withStatus(ColumnCompareEquivalent, "base sql type name")
 	}
 

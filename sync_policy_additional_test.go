@@ -121,17 +121,21 @@ func TestResolveColumnTypeSyncActionUnaliasedPrefixMatchStaysSilent(t *testing.T
 // TestResolveColumnTypeSyncActionMySQLNumericPrefixMatchStaysSilent is the
 // real-dialect counterpart of the guard above: mysql aliases "numeric" to
 // "decimal", so CompareColumns reports a bare "NUMERIC" struct column
-// against a literal "NUMERIC(10,2)" db column as Different (see
-// dialects.TestCompareColumnsMySQLNumericPrefixMismatch), and
-// resolveColumnTypeSyncAction must still stay silent for it.
+// against a literal "NUMERIC(10,2)" db column as ColumnCompareEquivalent
+// (see dialects.TestCompareColumnsMySQLNumericPrefixMismatch, whose
+// aliasing-both-sides fix is what makes this Equivalent rather than
+// Different), and resolveColumnTypeSyncAction must still stay silent for
+// it - now via the early "!IsDifferent()" return rather than via
+// columnTypeBaseNameMatchesPrefix, but the resulting action is unchanged
+// either way.
 func TestResolveColumnTypeSyncActionMySQLNumericPrefixMatchStaysSilent(t *testing.T) {
 	dialect := mustInitTestDialect(t, schemas.MYSQL)
 	expect := &schemas.Column{Name: "n", SQLType: schemas.SQLType{Name: schemas.Numeric}}
 	actual := &schemas.Column{Name: "n", SQLType: schemas.SQLType{Name: schemas.Numeric}, Length: 10, Length2: 2}
 
 	comparison := dialect.CompareColumns(expect, actual)
-	if !comparison.Type.IsDifferent() {
-		t.Fatalf("comparison.Type.IsDifferent() = false, want true")
+	if comparison.Type.IsDifferent() {
+		t.Fatalf("comparison.Type.IsDifferent() = true, want false")
 	}
 
 	features := dialects.ColumnSyncFeatures{TextFromVarchar: true, VarcharLengthChange: true, ColumnComment: true}
@@ -151,12 +155,22 @@ func TestResolveColumnTypeSyncActionMySQLNumericPrefixMatchStaysSilent(t *testin
 // same way (silent) against a "NUMERIC(10,2)" column, and the two unsized
 // spellings must also agree (silent) against a bare "NUMERIC" column.
 //
-// Only the two bare-vs-sized rows ("decimal_vs_sized_numeric_column" and
-// "numeric_vs_sized_numeric_column") actually reach
-// columnTypeBaseNameMatchesPrefix: compareColumnTypes classifies every other
-// row as Equal or Equivalent before that guard runs, so those rows document
-// the surrounding matrix rather than pinning the fix. See the reachesGuard
-// field below.
+// Before compareColumnTypes' base-name level aliased both sides, only the
+// two bare-vs-sized rows ("decimal_vs_sized_numeric_column" and
+// "numeric_vs_sized_numeric_column") reached columnTypeBaseNameMatchesPrefix:
+// "DECIMAL" (unaliased, already canonical) against aliased actual
+// "NUMERIC(10,2)" -> "DECIMAL(10,2)" never matched at level 4 and fell
+// through to Different, relying on resolveColumnTypeSyncAction's own guard
+// to stay silent; every other row was already Equal or Equivalent before
+// that guard ran.
+//
+// Now that level 4 aliases both sides (see dialects.TestCompareColumnsType's
+// "type aliases still match" case and compareColumnTypes itself), all six
+// rows resolve to Equal or Equivalent at compareColumnTypes and none of them
+// reach columnTypeBaseNameMatchesPrefix any more - reachesGuard is false for
+// every row. The field is kept, with its values updated, so a future change
+// that reopens the gap (and starts relying on the guard again for any of
+// these rows) fails loudly here instead of silently regressing.
 func TestResolveColumnTypeSyncActionPostgresDecimalNumericSynonymsMatchSymmetrically(t *testing.T) {
 	dialect := mustInitTestDialect(t, schemas.POSTGRES)
 	features := dialects.ColumnSyncFeatures{TextFromVarchar: true, VarcharLengthChange: true, ColumnComment: true}
@@ -168,18 +182,13 @@ func TestResolveColumnTypeSyncActionPostgresDecimalNumericSynonymsMatchSymmetric
 		actualLength   int64
 		// reachesGuard records whether CompareColumns classifies this pair as
 		// Different, meaning resolveColumnTypeSyncAction's
-		// columnTypeBaseNameMatchesPrefix guard is what silences it. The other
-		// rows are already Equal or Equivalent before that guard runs at all
-		// (compareColumnTypes's own equal/normalized/base-name levels), so
-		// they document the surrounding matrix without pinning the guard
-		// itself - asserting this explicitly means a future change that
-		// silently moves a row across that boundary fails loudly here
-		// instead of the guard's coverage quietly shrinking.
+		// columnTypeBaseNameMatchesPrefix guard would be what silences it.
+		// Every row is false now that level 4 aliases both sides.
 		reachesGuard bool
 	}{
-		{"decimal_vs_sized_numeric_column", schemas.Decimal, 0, 10, true},
+		{"decimal_vs_sized_numeric_column", schemas.Decimal, 0, 10, false},
 		{"sized_decimal_vs_sized_numeric_column", schemas.Decimal, 10, 10, false},
-		{"numeric_vs_sized_numeric_column", schemas.Numeric, 0, 10, true},
+		{"numeric_vs_sized_numeric_column", schemas.Numeric, 0, 10, false},
 		{"sized_numeric_vs_sized_numeric_column", schemas.Numeric, 10, 10, false},
 		{"decimal_vs_bare_numeric_column", schemas.Decimal, 0, 0, false},
 		{"numeric_vs_bare_numeric_column", schemas.Numeric, 0, 0, false},
