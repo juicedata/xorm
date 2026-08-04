@@ -276,6 +276,41 @@ func TestBuildColumnSyncDecisionIgnoresCommentWithoutFeature(t *testing.T) {
 	}
 }
 
+// TestBuildColumnSyncDecisionCommentSyncRequiresExactTypeMatch is a P1
+// regression guard for xorm/xorm#2591: comparison.Type being merely
+// ColumnCompareEquivalent (not ColumnCompareEqual) must not let a comment
+// sync through, because applyColumnSyncDecision's modifyComment branch
+// runs a full ModifyColumnSQL using the rendered Expected type text. For
+// an Equivalent-but-not-Equal pair (a real NUMERIC(19,4) column against a
+// struct tagged DECIMAL(10,2), which compareColumnTypes' base-name level
+// treats as the same base type), that ModifyColumnSQL genuinely narrows
+// the column on postgres/mysql ("ALTER TABLE ... ALTER COLUMN ... TYPE
+// DECIMAL(10,2)") as a side effect of "just" syncing a comment. The
+// trade-off this enforces: a genuinely Equivalent pair (e.g. db INT(11)
+// vs struct INT) no longer gets its comment synced either, which is
+// preferable to silently narrowing a column - see resolveCommentSyncDecision.
+func TestBuildColumnSyncDecisionCommentSyncRequiresExactTypeMatch(t *testing.T) {
+	features := dialects.ColumnSyncFeatures{ColumnComment: true}
+	comparison := dialects.ColumnComparison{
+		Type:     dialects.ColumnCompareField{Status: dialects.ColumnCompareEquivalent, Expected: "DECIMAL(10,2)", Actual: "NUMERIC(19,4)", Reason: "base sql type name"},
+		Comment:  dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"},
+		Expected: &schemas.Column{Name: "price", Length: 10, Length2: 2},
+		Actual:   &schemas.Column{Name: "price", Length: 19, Length2: 4},
+	}
+
+	decision := buildColumnSyncDecision(nil, features, comparison)
+
+	if decision.typeAction != columnTypeSyncActionNone {
+		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
+	}
+	if decision.modifyComment {
+		t.Fatalf("decision.modifyComment = true, want false: an Equivalent-but-not-Equal type pair must not run ModifyColumnSQL for a comment-only sync")
+	}
+	if !decision.commentSkippedTypeMismatch {
+		t.Fatalf("decision.commentSkippedTypeMismatch = false, want true so applyColumnSyncDecision can log the skip")
+	}
+}
+
 // TestApplyColumnSyncDecisionWarnMessageFormats is a regression guard for
 // v1's inconsistent Warnf format strings: the text-from-varchar warning
 // ends with a trailing newline, while the general type-mismatch warning
@@ -488,5 +523,214 @@ func TestApplyColumnSyncDecisionKeepsWarningsWhenExecFails(t *testing.T) {
 	wantNullableWarn := "Table %s Column %s db nullable is %v, struct nullable is %v"
 	if logger.warnfFormats[1] != wantNullableWarn {
 		t.Fatalf("nullable warn format = %q, want %q", logger.warnfFormats[1], wantNullableWarn)
+	}
+}
+
+// TestApplyColumnSyncDecisionLogsWhenCommentSyncSkippedForTypeMismatch is
+// the executed-path counterpart of
+// TestBuildColumnSyncDecisionCommentSyncRequiresExactTypeMatch: it pins
+// both that no SQL runs (session.exec would panic against this test
+// engine's unconnected database) and that the skip is logged, not silent
+// (xorm/xorm#2591's review finding). This logs at Infof, not Warnf: the
+// skip fires whenever comparison.Type.Status is ColumnCompareEquivalent -
+// a pair compareColumnTypes itself considers semantically the same type -
+// which is exactly the category xorm/xorm#2583 and go-gitea/gitea#22275
+// established must never warn, and unlike a genuine mismatch this
+// condition can never be resolved (the comment can never be applied), so
+// it would repeat on every startup forever if it warned.
+func TestApplyColumnSyncDecisionLogsWhenCommentSyncSkippedForTypeMismatch(t *testing.T) {
+	engine := newTestEngine(t)
+	logger := &recordingSyncLogger{}
+	engine.logger = logger
+	session := engine.NewSession()
+	defer session.Close()
+
+	features := dialects.ColumnSyncFeatures{ColumnComment: true}
+	comparison := dialects.ColumnComparison{
+		Type:     dialects.ColumnCompareField{Status: dialects.ColumnCompareEquivalent, Expected: "DECIMAL(10,2)", Actual: "NUMERIC(19,4)", Reason: "base sql type name"},
+		Comment:  dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"},
+		Expected: &schemas.Column{Name: "price", Length: 10, Length2: 2},
+		Actual:   &schemas.Column{Name: "price", Length: 19, Length2: 4},
+	}
+	decision := buildColumnSyncDecision(nil, features, comparison)
+
+	if err := applyColumnSyncDecision(session, "tbl", "tbl", comparison, decision); err != nil {
+		t.Fatalf("applyColumnSyncDecision() error = %v", err)
+	}
+
+	if len(logger.warnfFormats) != 0 {
+		t.Fatalf("logger.warnfFormats = %v, want none: this must not warn, it is an Equivalent (not Different) type pair", logger.warnfFormats)
+	}
+	if len(logger.infofFormats) != 1 {
+		t.Fatalf("len(logger.infofFormats) = %d, want 1 (the comment-sync-skipped notice)", len(logger.infofFormats))
+	}
+
+	wantInfo := "Table %s column %s comment not synced because db type is %s, struct type is %s"
+	if logger.infofFormats[0] != wantInfo {
+		t.Fatalf("comment-skipped info format = %q, want %q", logger.infofFormats[0], wantInfo)
+	}
+}
+
+// varcharPairComparison builds the ColumnComparison a real dialect
+// produces for a varchar/varchar pair whose length differs:
+// compareColumnTypes's level 4 base-sql-type-name fallback never
+// distinguishes that from a spelling-only synonym like NUMERIC/DECIMAL, so
+// Type.Status is always ColumnCompareEquivalent here, never
+// ColumnCompareEqual or ColumnCompareDifferent.
+func varcharPairComparison(expectedType, actualType string, expectedLength, actualLength int64) dialects.ColumnComparison {
+	return dialects.ColumnComparison{
+		Type: dialects.ColumnCompareField{
+			Status:   dialects.ColumnCompareEquivalent,
+			Expected: expectedType,
+			Actual:   actualType,
+			Reason:   "base sql type name",
+		},
+		Expected: &schemas.Column{Name: "col", Length: expectedLength},
+		Actual:   &schemas.Column{Name: "col", Length: actualLength},
+	}
+}
+
+// TestResolveVarcharWidenSyncActionExpands is the xorm/xorm#2588 fix:
+// buildColumnSyncDecision recognizes a varchar/varchar pair independently
+// of compareColumnTypes's ColumnCompareEquivalent status, so the sync
+// policy can see the length difference and widen the column.
+func TestResolveVarcharWidenSyncActionExpands(t *testing.T) {
+	features := dialects.ColumnSyncFeatures{VarcharLengthChange: true}
+	comparison := varcharPairComparison("VARCHAR(255)", "VARCHAR(64)", 255, 64)
+
+	if got := resolveVarcharWidenSyncAction(features, comparison); got != columnTypeSyncActionModifyVarcharExpand {
+		t.Fatalf("resolveVarcharWidenSyncAction() = %v, want columnTypeSyncActionModifyVarcharExpand", got)
+	}
+}
+
+func TestResolveVarcharWidenSyncActionShrinkStaysSilent(t *testing.T) {
+	features := dialects.ColumnSyncFeatures{VarcharLengthChange: true}
+	comparison := varcharPairComparison("VARCHAR(64)", "VARCHAR(255)", 64, 255)
+
+	if got := resolveVarcharWidenSyncAction(features, comparison); got != columnTypeSyncActionNone {
+		t.Fatalf("resolveVarcharWidenSyncAction() = %v, want columnTypeSyncActionNone", got)
+	}
+}
+
+func TestResolveVarcharWidenSyncActionUnsupportedDialectStaysSilent(t *testing.T) {
+	features := dialects.ColumnSyncFeatures{VarcharLengthChange: false}
+	comparison := varcharPairComparison("VARCHAR(255)", "VARCHAR(64)", 255, 64)
+
+	if got := resolveVarcharWidenSyncAction(features, comparison); got != columnTypeSyncActionNone {
+		t.Fatalf("resolveVarcharWidenSyncAction() = %v, want columnTypeSyncActionNone", got)
+	}
+}
+
+// TestResolveVarcharWidenSyncActionUnboundedActualStaysSilent is the
+// xorm/xorm#2588 review fix: postgres reports an unbounded "character
+// varying" column with Length == 0, and 0 < N reads as "shorter" unless
+// this is explicitly excluded - which would otherwise narrow an unbounded
+// column into a bounded one via an ALTER TABLE ... TYPE varchar(N).
+func TestResolveVarcharWidenSyncActionUnboundedActualStaysSilent(t *testing.T) {
+	features := dialects.ColumnSyncFeatures{VarcharLengthChange: true}
+	comparison := varcharPairComparison("VARCHAR(255)", "VARCHAR", 255, 0)
+
+	if got := resolveVarcharWidenSyncAction(features, comparison); got != columnTypeSyncActionNone {
+		t.Fatalf("resolveVarcharWidenSyncAction() = %v, want columnTypeSyncActionNone", got)
+	}
+}
+
+// TestBuildColumnSyncDecisionVarcharPairWidens exercises the new arm end
+// to end: a varchar/varchar pair with a widening-capable dialect must
+// produce the expand action and must not also sync the comment (at most
+// one ModifyColumnSQL per column).
+func TestBuildColumnSyncDecisionVarcharPairWidens(t *testing.T) {
+	features := dialects.ColumnSyncFeatures{VarcharLengthChange: true, ColumnComment: true}
+	comparison := varcharPairComparison("VARCHAR(255)", "VARCHAR(64)", 255, 64)
+	comparison.Comment = dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"}
+
+	decision := buildColumnSyncDecision(nil, features, comparison)
+
+	if decision.typeAction != columnTypeSyncActionModifyVarcharExpand {
+		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionModifyVarcharExpand", decision.typeAction)
+	}
+	if decision.modifyComment {
+		t.Fatalf("decision.modifyComment = true, want false: at most one ModifyColumnSQL must run per column")
+	}
+}
+
+// TestBuildColumnSyncDecisionVarcharPairFallsThroughToCommentGate is the
+// composition-bug regression found in review of the entangled
+// xorm/xorm#2588/#2589/#2591 work: when the varchar arm resolves to no
+// action (a shrink, an unbounded actual column, or a dialect without
+// VarcharLengthChange, such as gbase8s), it must fall through to
+// resolveCommentSyncDecision - the same shared gate every other arm uses -
+// rather than syncing the comment unconditionally. A varchar/varchar pair
+// whose lengths differ is always ColumnCompareEquivalent, never Equal, so
+// the gate must refuse the comment here too: syncing "just" the comment
+// would still run ModifyColumnSQL with the struct's full (narrower)
+// column definition, silently shrinking the actual column. This is
+// stricter than the varchar-widen fix's original behavior, which synced
+// the comment unconditionally on this fall-through - that unconditional
+// sync was the P1 bug: see
+// TestBuildColumnSyncDecisionVarcharPairFallsThroughWhenTypesMatchExactly
+// for the shape (a genuine length-preserving change) where the comment
+// still does get synced.
+func TestBuildColumnSyncDecisionVarcharPairFallsThroughToCommentGate(t *testing.T) {
+	features := dialects.ColumnSyncFeatures{VarcharLengthChange: false, ColumnComment: true}
+	comparison := varcharPairComparison("VARCHAR(255)", "VARCHAR(64)", 255, 64)
+	comparison.Comment = dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"}
+
+	decision := buildColumnSyncDecision(nil, features, comparison)
+
+	if decision.typeAction != columnTypeSyncActionNone {
+		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
+	}
+	if decision.modifyComment {
+		t.Fatalf("decision.modifyComment = true, want false: a varchar length difference is never ColumnCompareEqual, so the shared gate must refuse the comment sync too")
+	}
+	if !decision.commentSkippedTypeMismatch {
+		t.Fatalf("decision.commentSkippedTypeMismatch = false, want true so the skip is logged")
+	}
+}
+
+// TestBuildColumnSyncDecisionVarcharPairFallsThroughWhenTypesMatchExactly
+// is the positive counterpart: when the varchar arm's own Type.Status
+// genuinely is ColumnCompareEqual (both sides render identically) and
+// only the comment differs, the shared gate still lets the sync through
+// via the fall-through path, exactly as it would from the plain comment
+// arm.
+func TestBuildColumnSyncDecisionVarcharPairFallsThroughWhenTypesMatchExactly(t *testing.T) {
+	features := dialects.ColumnSyncFeatures{VarcharLengthChange: true, ColumnComment: true}
+	comparison := dialects.ColumnComparison{
+		Type:     dialects.ColumnCompareField{Status: dialects.ColumnCompareEqual, Expected: "VARCHAR(255)", Actual: "VARCHAR(255)"},
+		Comment:  dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"},
+		Expected: &schemas.Column{Name: "col", Length: 255},
+		Actual:   &schemas.Column{Name: "col", Length: 255},
+	}
+
+	decision := buildColumnSyncDecision(nil, features, comparison)
+
+	if decision.typeAction != columnTypeSyncActionNone {
+		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
+	}
+	if !decision.modifyComment {
+		t.Fatalf("decision.modifyComment = false, want true: a byte-identical varchar pair must still let its comment sync")
+	}
+}
+
+// TestBuildColumnSyncDecisionBareVarcharTakesPriorityOverSizedPair pins
+// arm 2's exclusivity (resolveBareVarcharSyncAction) over the new arm: a
+// bare "VARCHAR" expected type against a sized actual column satisfies
+// both arm 2's condition and the new arm's isVarcharToVarchar condition,
+// and arm 2 (which always suppresses comment sync) must keep taking
+// priority, exactly as it did before this fix.
+func TestBuildColumnSyncDecisionBareVarcharTakesPriorityOverSizedPair(t *testing.T) {
+	features := dialects.ColumnSyncFeatures{ColumnComment: true, VarcharLengthChange: true}
+	comparison := varcharPairComparison(schemas.Varchar, "VARCHAR(255)", 0, 255)
+	comparison.Comment = dialects.ColumnCompareField{Status: dialects.ColumnCompareDifferent, Expected: "new", Actual: "old"}
+
+	decision := buildColumnSyncDecision(nil, features, comparison)
+
+	if decision.typeAction != columnTypeSyncActionNone {
+		t.Fatalf("decision.typeAction = %v, want columnTypeSyncActionNone", decision.typeAction)
+	}
+	if decision.modifyComment {
+		t.Fatalf("decision.modifyComment = true, want false: the bare-VARCHAR arm must still suppress comment sync")
 	}
 }

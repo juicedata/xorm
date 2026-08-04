@@ -695,3 +695,478 @@ func TestSyncWarningMSSQLLegacyDatetimeMatchesTimeTime(t *testing.T) {
 	assert.False(t, recorder.hasMessageContaining("created_at"),
 		"expected no warning about created_at, got: %v", recorder.messages())
 }
+
+// TestSyncWarningMySQLDecimalCommentDoesNotNarrowColumn is the
+// live-database reproduction of xorm/xorm#2591: a real MySQL/MariaDB
+// DECIMAL(19,4) column holding 1.2345, against a struct tagged
+// DECIMAL(10,2) with a differing comment, is ColumnCompareEquivalent (not
+// Equal) at the base-sql-type-name level. Before
+// resolveCommentSyncDecision gated comment sync on ColumnCompareEqual,
+// applyColumnSyncDecision's modifyComment branch ran
+// ModifyColumnSQL(tableName, expected) - "ALTER TABLE ... MODIFY price
+// DECIMAL(10,2) COMMENT 'new comment'" - as a side effect of "just"
+// syncing the comment, which silently rounds the stored value to the
+// struct's narrower scale. The read-back and stored-value assertions
+// below are load-bearing: the absence of a type-mismatch warning is not
+// enough on its own, since the old ModifyColumnSQL call logged nothing
+// either. The skip itself logs at Infof, not Warnf - see
+// resolveCommentSyncDecision - so recorder.hasMessageContaining below
+// matches an Info-level notice, not a warning.
+func TestSyncWarningMySQLDecimalCommentDoesNotNarrowColumn(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.MYSQL {
+		t.Skip("mysql/mariadb only")
+	}
+
+	const tableName = "sync_warning_mysql_decimal_comment_no_narrow"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, price DECIMAL(19,4) NOT NULL COMMENT 'old comment')",
+		qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	_, err = testEngine.Exec(fmt.Sprintf(
+		"INSERT INTO %s (id, price) VALUES (1, 1.2345)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	before := columnFromDBMetas(t, tableName, "price")
+	assert.EqualValues(t, 19, before.Length, "sanity: decimal(19,4) column should read back with precision 19")
+	assert.EqualValues(t, 4, before.Length2, "sanity: decimal(19,4) column should read back with scale 4")
+
+	type SyncWarningMySQLDecimalCommentNoNarrow struct {
+		Id    int64   `xorm:"pk"`
+		Price float64 `xorm:"DECIMAL(10,2) comment('new comment')"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningMySQLDecimalCommentNoNarrow)))
+	assert.True(t, recorder.hasMessageContaining("comment not synced"),
+		"expected a comment-sync-skipped notice about price, got: %v", recorder.messages())
+	assert.False(t, recorder.warnfHasMessageContaining("comment not synced"),
+		"expected the comment-sync-skipped notice to log at Infof, not Warnf: got Warnf messages %v", recorder.warnfMessages())
+	assert.Equal(t, []string{"Table sync_warning_mysql_decimal_comment_no_narrow column price comment not synced because db type is DECIMAL(19,4), struct type is DECIMAL(10,2)"},
+		recorder.infofMessages(), "expected exactly one Infof notice, with no other Infof calls for this column")
+
+	after := columnFromDBMetas(t, tableName, "price")
+	assert.EqualValues(t, 19, after.Length,
+		"expected Sync to leave the decimal(19,4) column's precision unchanged even though its comment differs from the struct tag")
+	assert.EqualValues(t, 4, after.Length2,
+		"expected Sync to leave the decimal(19,4) column's scale unchanged even though its comment differs from the struct tag")
+	assert.Equal(t, "old comment", after.Comment,
+		"expected the comment to stay unsynced since the rendered types are not byte-identical")
+
+	var price float64
+	has, err := testEngine.Table(tableName).Cols("price").Where("id = ?", 1).Get(&price)
+	assert.NoError(t, err)
+	assert.True(t, has)
+	assert.InDelta(t, 1.2345, price, 0.00001,
+		"expected the stored value to survive Sync without being rounded to the struct tag's narrower scale")
+}
+
+// TestSyncWarningVarcharShrinkWithCommentDoesNotNarrowColumn is the P1
+// composition regression from review of xorm/xorm#2588/#2589/#2591: a
+// database VARCHAR(255) column against a struct wanting VARCHAR(64), with
+// a differing comment, is ColumnCompareEquivalent (base sql type name),
+// never Equal, since the rendered lengths differ. Before
+// resolveCommentSyncDecision's gate, a differing comment on this shape
+// reached applyColumnSyncDecision's modifyComment branch, which reissues
+// the struct's full expected column definition through ModifyColumnSQL -
+// "ALTER TABLE ... MODIFY lower_name VARCHAR(64) COMMENT 'new comment'" on
+// mysql - silently narrowing the column and truncating any stored value
+// too long to fit.
+func TestSyncWarningVarcharShrinkWithCommentDoesNotNarrowColumn(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	switch testEngine.Dialect().URI().DBType {
+	case schemas.MYSQL, schemas.POSTGRES:
+	default:
+		t.Skip("mysql/postgres only")
+	}
+
+	const tableName = "sync_warning_varchar_shrink_comment_no_narrow"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	longValue := strings.Repeat("x", 200)
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, lower_name VARCHAR(255) NOT NULL)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	_, err = testEngine.Exec(fmt.Sprintf(
+		"INSERT INTO %s (id, lower_name) VALUES (1, '%s')", qualifiedTableName(tableName), longValue))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	type SyncWarningVarcharShrinkWithComment struct {
+		Id        int64  `xorm:"pk"`
+		LowerName string `xorm:"VARCHAR(64) comment('new comment')"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningVarcharShrinkWithComment)))
+	assert.True(t, recorder.hasMessageContaining("comment not synced"),
+		"expected a comment-sync-skipped notice about lower_name, got: %v", recorder.messages())
+	assert.False(t, recorder.warnfHasMessageContaining("comment not synced"),
+		"expected the comment-sync-skipped notice to log at Infof, not Warnf: got Warnf messages %v", recorder.warnfMessages())
+
+	col := columnFromDBMetas(t, tableName, "lower_name")
+	assert.EqualValues(t, 255, col.Length,
+		"expected lower_name to stay VARCHAR(255), a shrink triggered by comment sync must not be applied")
+
+	var storedValue string
+	has, err := testEngine.Table(tableName).Cols("lower_name").Where("id = ?", 1).Get(&storedValue)
+	assert.NoError(t, err)
+	assert.True(t, has)
+	assert.Equal(t, longValue, storedValue,
+		"expected the stored value to survive Sync without being truncated to the struct tag's narrower length")
+}
+
+// TestSyncWarningCommentSyncsWhenTypesMatchExactly is the positive
+// counterpart to the comment-skip tests above: resolveCommentSyncDecision
+// must still sync a differing comment when the rendered types are
+// byte-identical (ColumnCompareEqual), since that is the shape the gate
+// is designed to keep working, not to disable comment sync entirely.
+func TestSyncWarningCommentSyncsWhenTypesMatchExactly(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	switch testEngine.Dialect().URI().DBType {
+	case schemas.MYSQL, schemas.POSTGRES:
+	default:
+		t.Skip("mysql/postgres only")
+	}
+
+	const tableName = "sync_warning_comment_syncs_when_types_match"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, lower_name VARCHAR(100) NOT NULL)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	before := columnFromDBMetas(t, tableName, "lower_name")
+	assert.Equal(t, "", before.Comment, "sanity: freshly created column should have no comment")
+
+	type SyncWarningCommentSyncsWhenTypesMatch struct {
+		Id        int64  `xorm:"pk"`
+		LowerName string `xorm:"VARCHAR(100) NOT NULL comment('new comment')"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningCommentSyncsWhenTypesMatch)))
+	assert.False(t, recorder.hasMessageContaining("comment not synced"),
+		"expected no comment-sync-skipped notice, got: %v", recorder.messages())
+
+	after := columnFromDBMetas(t, tableName, "lower_name")
+	assert.Equal(t, "new comment", after.Comment,
+		"expected the comment to sync when the rendered types are byte-identical")
+}
+
+// TestSyncWarningMariaDBIntDisplayWidthCommentSkipped pins the first of
+// the three real costs documented on resolveCommentSyncDecision: MariaDB
+// 10.6 (and MySQL <= 8.0.18) report a plain INT column as "int(11)", so a
+// bare `xorm:"INT"` struct type renders without a width and the pair is
+// ColumnCompareEquivalent ("normalized sql type", level 3 strips the
+// display width), never ColumnCompareEqual - on tables xorm itself
+// created, this disables comment sync for every int-family column. The
+// test skips itself on a MySQL version that does not reproduce the
+// display-width read-back (MySQL 8.0.19+), so it is a live pin rather than
+// an assumption. See TestSyncWarningMySQLTextDisplayLengthCommentSkipped
+// and TestSyncWarningPostgresDecimalNumericSpellingCommentSkipped for the
+// other two documented shapes.
+func TestSyncWarningMariaDBIntDisplayWidthCommentSkipped(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.MYSQL {
+		t.Skip("mysql/mariadb only")
+	}
+
+	const tableName = "sync_warning_mariadb_int_width_comment_skipped"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, num_watches INT NOT NULL DEFAULT 0 COMMENT 'old comment')",
+		qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	before := columnFromDBMetas(t, tableName, "num_watches")
+	if before.Length == 0 {
+		t.Skip("this MySQL version does not read a bare INT column back with a display width")
+	}
+
+	type SyncWarningMariaDBIntWidthCommentSkipped struct {
+		Id         int64 `xorm:"pk"`
+		NumWatches int32 `xorm:"NOT NULL DEFAULT 0 comment('new comment')"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningMariaDBIntWidthCommentSkipped)))
+	assert.True(t, recorder.hasMessageContaining("comment not synced because db type is"),
+		"expected a comment-sync-skipped notice about num_watches, got: %v", recorder.messages())
+	assert.False(t, recorder.warnfHasMessageContaining("comment not synced"),
+		"expected the comment-sync-skipped notice to log at Infof, not Warnf: got Warnf messages %v", recorder.warnfMessages())
+
+	after := columnFromDBMetas(t, tableName, "num_watches")
+	assert.Equal(t, "old comment", after.Comment,
+		"expected the comment to stay unsynced: the display-width read-back keeps this pair Equivalent, never Equal")
+}
+
+// TestSyncWarningMySQLTextDisplayLengthCommentSkipped pins the second of
+// the three real costs documented on resolveCommentSyncDecision: on every
+// MySQL 8.0 version (not just old ones - the display-width class above is
+// version-dependent, this one is not), a bare `xorm:"TEXT"` column reads
+// back as "text(65535)" (CHARACTER_MAXIMUM_LENGTH is populated for TEXT),
+// while the struct's bare TEXT tag never renders a length. The pair is
+// ColumnCompareEquivalent (level 3, normalized sql type strips the
+// length for a TEXT/BLOB family type), never ColumnCompareEqual, so every
+// commented TEXT/BLOB-family column stops syncing its comment.
+func TestSyncWarningMySQLTextDisplayLengthCommentSkipped(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.MYSQL {
+		t.Skip("mysql/mariadb only")
+	}
+
+	const tableName = "sync_warning_mysql_text_length_comment_skipped"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, body TEXT NOT NULL COMMENT 'old comment')",
+		qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	before := columnFromDBMetas(t, tableName, "body")
+	if before.Length == 0 {
+		t.Skip("this MySQL version does not read a bare TEXT column back with a display length")
+	}
+
+	type SyncWarningMySQLTextLengthCommentSkipped struct {
+		Id   int64  `xorm:"pk"`
+		Body string `xorm:"TEXT NOT NULL comment('new comment')"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningMySQLTextLengthCommentSkipped)))
+	assert.True(t, recorder.hasMessageContaining("comment not synced because db type is"),
+		"expected a comment-sync-skipped notice about body, got: %v", recorder.messages())
+	assert.False(t, recorder.warnfHasMessageContaining("comment not synced"),
+		"expected the comment-sync-skipped notice to log at Infof, not Warnf: got Warnf messages %v", recorder.warnfMessages())
+
+	after := columnFromDBMetas(t, tableName, "body")
+	assert.Equal(t, "old comment", after.Comment,
+		"expected the comment to stay unsynced: the display-length read-back keeps this pair Equivalent, never Equal")
+}
+
+// TestSyncWarningPostgresDecimalNumericSpellingCommentSkipped pins the
+// third of the three real costs documented on resolveCommentSyncDecision:
+// postgres's own catalog normalizes a column declared DECIMAL(p,s) to
+// NUMERIC(p,s) (see TestSyncWarningPostgresNumericPrecisionReadBack),
+// while a struct tagged `xorm:"DECIMAL(10,2)"` renders "DECIMAL(10,2)".
+// The pair is ColumnCompareEquivalent (base sql type name - postgres
+// aliases "numeric" to "decimal"), never ColumnCompareEqual, so every
+// commented DECIMAL/NUMERIC column stops syncing its comment, regardless
+// of MySQL version quirks - this is a postgres catalog behavior, not a
+// display-width read-back artifact.
+func TestSyncWarningPostgresDecimalNumericSpellingCommentSkipped(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.POSTGRES {
+		t.Skip("postgres only")
+	}
+
+	const tableName = "sync_warning_postgres_decimal_numeric_comment_skipped"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, price DECIMAL(10,2) NOT NULL)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	_, err = testEngine.Exec(fmt.Sprintf(
+		"COMMENT ON COLUMN %s.price IS 'old comment'", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	before := columnFromDBMetas(t, tableName, "price")
+	assert.Equal(t, schemas.Numeric, before.SQLType.Name,
+		"sanity: postgres should read a DECIMAL(10,2) column back as NUMERIC")
+
+	type SyncWarningPostgresDecimalNumericSpellingCommentSkipped struct {
+		Id    int64   `xorm:"pk"`
+		Price float64 `xorm:"DECIMAL(10,2) comment('new comment')"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningPostgresDecimalNumericSpellingCommentSkipped)))
+	assert.True(t, recorder.hasMessageContaining("comment not synced because db type is"),
+		"expected a comment-sync-skipped notice about price, got: %v", recorder.messages())
+	assert.False(t, recorder.warnfHasMessageContaining("comment not synced"),
+		"expected the comment-sync-skipped notice to log at Infof, not Warnf: got Warnf messages %v", recorder.warnfMessages())
+
+	after := columnFromDBMetas(t, tableName, "price")
+	assert.Equal(t, "old comment", after.Comment,
+		"expected the comment to stay unsynced: the NUMERIC/DECIMAL spelling keeps this pair Equivalent, never Equal")
+}
+
+// TestSyncWarningVarcharLengthWidened is the xorm/xorm#2588 fix: a
+// database VARCHAR(64) column against a struct wanting VARCHAR(255) must
+// widen to 255 on mysql/postgres, with an Infof announcement but no Warnf.
+// warningRecorder captures both Infof and Warnf calls, so the assertion
+// below is scoped to the "db type is" text Warnf uses rather than the
+// column name, which would also match the expected Infof announcement.
+func TestSyncWarningVarcharLengthWidened(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	switch testEngine.Dialect().URI().DBType {
+	case schemas.MYSQL, schemas.POSTGRES:
+	default:
+		t.Skip("mysql/postgres only")
+	}
+
+	const tableName = "sync_warning_varchar_length_widened"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, lower_name VARCHAR(64) NOT NULL)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	type SyncWarningVarcharLengthWidened struct {
+		Id        int64  `xorm:"pk"`
+		LowerName string `xorm:"VARCHAR(255) NOT NULL"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningVarcharLengthWidened)))
+	assert.False(t, recorder.hasMessageContaining("db type is"),
+		"expected no type-mismatch warning about lower_name, got: %v", recorder.messages())
+
+	col := columnFromDBMetas(t, tableName, "lower_name")
+	assert.EqualValues(t, 255, col.Length,
+		"expected lower_name to widen from VARCHAR(64) to VARCHAR(255)")
+}
+
+// TestSyncWarningVarcharLengthShrinkNotApplied is the shrink counterpart of
+// TestSyncWarningVarcharLengthWidened: a database VARCHAR(255) column
+// against a struct wanting VARCHAR(64) must not warn and must not be
+// altered, even on dialects that support widening. Only a database column
+// shorter than the struct wants is ever a candidate for
+// columnTypeSyncActionModifyVarcharExpand (see resolveVarcharWidenSyncAction
+// in sync.go).
+func TestSyncWarningVarcharLengthShrinkNotApplied(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	switch testEngine.Dialect().URI().DBType {
+	case schemas.MYSQL, schemas.POSTGRES:
+	default:
+		t.Skip("mysql/postgres only")
+	}
+
+	const tableName = "sync_warning_varchar_length_shrink_not_applied"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, lower_name VARCHAR(255) NOT NULL)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	type SyncWarningVarcharLengthShrinkNotApplied struct {
+		Id        int64  `xorm:"pk"`
+		LowerName string `xorm:"VARCHAR(64) NOT NULL"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningVarcharLengthShrinkNotApplied)))
+	assert.False(t, recorder.hasMessageContaining("lower_name"),
+		"expected no warning about lower_name, got: %v", recorder.messages())
+
+	col := columnFromDBMetas(t, tableName, "lower_name")
+	assert.EqualValues(t, 255, col.Length,
+		"expected lower_name to stay VARCHAR(255), a shrink must not be applied")
+}
+
+// TestSyncWarningPostgresUnboundedVarcharNotWidened is the xorm/xorm#2588
+// review fix: postgres reports an unbounded "character varying" column
+// (declared without a length) with Length == 0, and 0 < 255 reads as
+// "shorter" unless resolveVarcharWidenSyncAction explicitly excludes a
+// zero actual length. Without that exclusion, Sync would run
+// `ALTER TABLE ... TYPE varchar(255)`, which narrows an unbounded column -
+// a silent capacity reduction at best, and a failing ALTER (or a runtime
+// "value too long" error on the next oversized INSERT/UPDATE) at worst.
+// Bare "VARCHAR" is not legal DDL on mysql/mariadb (VARCHAR requires a
+// length there), so this shape is postgres-only.
+func TestSyncWarningPostgresUnboundedVarcharNotWidened(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	if testEngine.Dialect().URI().DBType != schemas.POSTGRES {
+		t.Skip("postgres only")
+	}
+
+	const tableName = "sync_warning_postgres_unbounded_varchar_not_widened"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, lower_name VARCHAR NOT NULL)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	col := columnFromDBMetas(t, tableName, "lower_name")
+	assert.EqualValues(t, 0, col.Length,
+		"expected GetColumns to read an unbounded character varying column back as Length 0")
+
+	type SyncWarningPostgresUnboundedVarchar struct {
+		Id        int64  `xorm:"pk"`
+		LowerName string `xorm:"VARCHAR(255) NOT NULL"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningPostgresUnboundedVarchar)))
+	assert.False(t, recorder.hasMessageContaining("lower_name"),
+		"expected no message about lower_name, got: %v", recorder.messages())
+
+	col = columnFromDBMetas(t, tableName, "lower_name")
+	assert.EqualValues(t, 0, col.Length,
+		"expected lower_name to stay unbounded, not be narrowed to varchar(255)")
+}
+
+// TestSyncWarningVarcharWidenTakesPriorityOverCommentSync combines the
+// xorm/xorm#2588 widen fix with the xorm/xorm#2591 comment gate:
+// applyColumnSyncDecision runs at most one ModifyColumnSQL per column, and
+// that single call renders the struct's entire expected column
+// definition, comment included - so a widen and a differing comment
+// resolve in the same statement without ever going through
+// resolveCommentSyncDecision (decision.modifyComment stays false, and so
+// does commentSkippedTypeMismatch: there was nothing to skip, since no
+// separate comment sync was attempted).
+func TestSyncWarningVarcharWidenTakesPriorityOverCommentSync(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	switch testEngine.Dialect().URI().DBType {
+	case schemas.MYSQL, schemas.POSTGRES:
+	default:
+		t.Skip("mysql/postgres only")
+	}
+
+	const tableName = "sync_warning_varchar_widen_with_comment"
+	dropTestTable(tableName)
+	defer dropTestTable(tableName)
+
+	_, err := testEngine.Exec(fmt.Sprintf(
+		"CREATE TABLE %s (id BIGINT NOT NULL PRIMARY KEY, lower_name VARCHAR(64) NOT NULL)", qualifiedTableName(tableName)))
+	assert.NoError(t, err)
+	assertTableVisible(t, tableName)
+
+	type SyncWarningVarcharWidenWithComment struct {
+		Id        int64  `xorm:"pk"`
+		LowerName string `xorm:"VARCHAR(255) NOT NULL comment('new comment')"`
+	}
+
+	recorder := captureWarnings(t)
+	assert.NoError(t, testEngine.Table(tableName).Sync(new(SyncWarningVarcharWidenWithComment)))
+	assert.False(t, recorder.hasMessageContaining("comment not synced"),
+		"expected no comment-sync-skipped warning, got: %v", recorder.messages())
+
+	col := columnFromDBMetas(t, tableName, "lower_name")
+	assert.EqualValues(t, 255, col.Length,
+		"expected lower_name to widen from VARCHAR(64) to VARCHAR(255)")
+	assert.Equal(t, "new comment", col.Comment,
+		"expected the comment to sync as part of the widen's own ModifyColumnSQL, which renders the full expected column")
+}
