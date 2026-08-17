@@ -1,0 +1,30 @@
+name: Sync v1 and tags from Gitea
+
+on:
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-gitea-v1
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Synchronize v1 and tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Synchronize v1 and tags
+        env:
+          SOURCE_REPOSITORY: https://gitea.com/xorm/xorm.git
+        run: bash scripts/sync-v1-and-tags.sh
