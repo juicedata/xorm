@@ -156,6 +156,18 @@ const (
 
 // IsTimeZero return true if a time is zero
 func IsTimeZero(t time.Time) bool {
-	return t.IsZero() || t.Format("2006-01-02 15:04:05.999999999") == ZeroTime0 ||
+	if t.IsZero() {
+		return true
+	}
+
+	// time.Time.IsZero only returns true when the time is 0001-01-01 in UTC.
+	// Check the date components directly so zero times in other time zones are
+	// handled consistently.
+	if t.Year() == 1 && t.Month() == time.January && t.Day() == 1 &&
+		t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0 {
+		return true
+	}
+
+	return t.Format("2006-01-02 15:04:05.999999999") == ZeroTime0 ||
 		t.Format("2006-01-02 15:04:05.999999999") == ZeroTime1
 }

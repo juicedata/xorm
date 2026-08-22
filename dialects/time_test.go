@@ -178,6 +178,24 @@ func TestFormatColumnTime(t *testing.T) {
 			wantRes:  date.Unix(),
 			wantErr:  nil,
 		},
+		{
+			name:     "format zero int in non-utc timezone",
+			dialect:  nil,
+			location: time.FixedZone("UTC+8", 8*60*60),
+			column:   &schemas.Column{SQLType: schemas.SQLType{Name: schemas.Int}},
+			time:     time.Date(1, 1, 1, 0, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60)),
+			wantRes:  0,
+			wantErr:  nil,
+		},
+		{
+			name:     "format zero bigint in non-utc timezone",
+			dialect:  nil,
+			location: time.FixedZone("UTC+8", 8*60*60),
+			column:   &schemas.Column{SQLType: schemas.SQLType{Name: schemas.BigInt}},
+			time:     time.Date(1, 1, 1, 0, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60)),
+			wantRes:  0,
+			wantErr:  nil,
+		},
 	}
 
 	for _, tt := range tests {

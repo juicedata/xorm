@@ -148,3 +148,31 @@ func TestIsValueZero(t *testing.T) {
 		})
 	}
 }
+
+func TestIsTimeZero(t *testing.T) {
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	assert.NoError(t, err)
+
+	zeroTimes := []time.Time{
+		{},
+		time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(1, 1, 1, 0, 0, 0, 0, shanghai),
+		time.Date(1, 1, 1, 0, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60)),
+	}
+	for _, zeroTime := range zeroTimes {
+		t.Run(zeroTime.String(), func(t *testing.T) {
+			assert.True(t, IsTimeZero(zeroTime))
+		})
+	}
+
+	nonZeroTimes := []time.Time{
+		time.Date(1, 1, 2, 0, 0, 0, 0, shanghai),
+		time.Date(1, 1, 1, 0, 0, 0, 1, shanghai),
+		time.Date(2020, 10, 23, 10, 14, 15, 0, shanghai),
+	}
+	for _, nonZeroTime := range nonZeroTimes {
+		t.Run(nonZeroTime.String(), func(t *testing.T) {
+			assert.False(t, IsTimeZero(nonZeroTime))
+		})
+	}
+}
