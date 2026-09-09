@@ -254,7 +254,7 @@ func (statement *Statement) writeForUpdate(w *builder.BytesWriter) error {
 	}
 
 	if statement.dialect.URI().DBType != schemas.MYSQL && statement.dialect.URI().DBType != schemas.POSTGRES {
-		return errors.New("only support mysql or postgres for update")
+		return nil
 	}
 	_, err := fmt.Fprint(w, " FOR UPDATE")
 	return err
