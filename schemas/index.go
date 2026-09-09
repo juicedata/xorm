@@ -57,14 +57,7 @@ func (index *Index) Equal(dst *Index) bool {
 	}
 
 	for i := 0; i < len(index.Cols); i++ {
-		var found bool
-		for j := 0; j < len(dst.Cols); j++ {
-			if index.Cols[i] == dst.Cols[j] {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if index.Cols[i] != dst.Cols[i] {
 			return false
 		}
 	}
