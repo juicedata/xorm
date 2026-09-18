@@ -530,3 +530,5 @@ You can find all the changelog [here](CHANGELOG.md)
 ## LICENSE
 
 BSD License [http://creativecommons.org/licenses/BSD/](http://creativecommons.org/licenses/BSD/)
+
+See [InsertIgnore](docs/insert-ignore.md) for native conflict-ignore insertion and the database compatibility matrix.

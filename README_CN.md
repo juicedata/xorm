@@ -522,3 +522,5 @@ res, err := engine.Transaction(func(session *xorm.Session) (interface{}, error) 
 
 BSD License
 [http://creativecommons.org/licenses/BSD/](http://creativecommons.org/licenses/BSD/)
+
+原生忽略重复记录的插入接口及数据库兼容性矩阵参见 [InsertIgnore](docs/insert-ignore.md)。

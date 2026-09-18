@@ -1207,6 +1207,14 @@ func (engine *Engine) Insert(beans ...any) (int64, error) {
 	return session.Insert(beans...)
 }
 
+// InsertIgnore inserts records like Insert, using the database's native conflict-ignore
+// clause. See Session.InsertIgnore for supported databases and semantics.
+func (engine *Engine) InsertIgnore(beans ...any) (int64, error) {
+	session := engine.NewSession()
+	defer session.Close()
+	return session.InsertIgnore(beans...)
+}
+
 // InsertOne insert only one record
 func (engine *Engine) InsertOne(bean any) (int64, error) {
 	session := engine.NewSession()

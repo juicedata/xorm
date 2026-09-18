@@ -1,0 +1,51 @@
+name: InsertIgnore compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [v1-ce]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - mysql:5.7
+          - mysql:8.0
+          - mysql:8.4
+          - mysql:latest
+          - mariadb:10.11
+          - mariadb:latest
+          - postgres:9.5
+          - postgres:12
+          - postgres:14
+          - postgres:16-alpine
+          - postgres:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.20.x'
+          cache: true
+      - run: scripts/test-insert-ignore.sh '${{ matrix.image }}'
+  sqlite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [2018/sqlite-amalgamation-3240000.zip, latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.20.x'
+          cache: true
+      - run: scripts/test-insert-ignore-sqlite.sh '${{ matrix.release }}'

@@ -44,6 +44,7 @@ type Interface interface {
 	In(string, ...any) *Session
 	Incr(column string, arg ...any) *Session
 	Insert(...any) (int64, error)
+	InsertIgnore(...any) (int64, error)
 	InsertOne(any) (int64, error)
 	IsTableEmpty(bean any) (bool, error)
 	IsTableExist(beanOrTableName any) (bool, error)

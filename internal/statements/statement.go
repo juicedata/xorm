@@ -74,6 +74,7 @@ type Statement struct {
 	UseAutoTime     bool
 	NoAutoCondition bool
 	IsDistinct      bool
+	InsertIgnore    bool
 	IsForUpdate     bool
 	TableAlias      string
 	allUseBool      bool
@@ -149,6 +150,7 @@ func (statement *Statement) Reset() {
 	statement.UseAutoTime = true
 	statement.NoAutoCondition = false
 	statement.IsDistinct = false
+	statement.InsertIgnore = false
 	statement.IsForUpdate = false
 	statement.TableAlias = ""
 	statement.SelectStr = ""

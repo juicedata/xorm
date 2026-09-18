@@ -5,6 +5,7 @@
 package xorm
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"reflect"
@@ -64,6 +65,15 @@ func (session *Session) Insert(beans ...any) (int64, error) {
 	}
 
 	return affected, err
+}
+
+// InsertIgnore inserts records like Insert, skipping rows rejected by the database's
+// conflict-ignore clause. It supports MySQL/MariaDB, SQLite and PostgreSQL 9.5+.
+// The returned count includes only inserted rows. MySQL and SQLite may also ignore
+// some non-unique constraint or data errors according to their native semantics.
+func (session *Session) InsertIgnore(beans ...any) (int64, error) {
+	session.statement.InsertIgnore = true
+	return session.Insert(beans...)
 }
 
 func (session *Session) insertMultipleStruct(rowsSlicePtr any) (int64, error) {
@@ -327,7 +337,7 @@ func (session *Session) insertStruct(bean any) (int64, error) {
 
 	// if there is auto increment column and driver don't support return it
 	if len(table.AutoIncrement) > 0 && !session.engine.driver.Features().SupportReturnInsertedID {
-		var sql string
+		var query string
 		var newArgs []any
 		var needCommit bool
 		var id int64
@@ -349,15 +359,18 @@ func (session *Session) insertStruct(bean any) (int64, error) {
 					return 0, err
 				}
 			} else {
-				sql = fmt.Sprintf("select %s.currval from dual", utils.SeqName(tableName))
+				query = fmt.Sprintf("select %s.currval from dual", utils.SeqName(tableName))
 			}
 		} else {
-			sql = sqlStr
+			query = sqlStr
 			newArgs = args
 		}
 
 		if id == 0 {
-			err := session.queryRow(sql, newArgs...).Scan(&id)
+			err := session.queryRow(query, newArgs...).Scan(&id)
+			if session.statement.InsertIgnore && errors.Is(err, sql.ErrNoRows) {
+				return 0, nil
+			}
 			if err != nil {
 				return 0, err
 			}
@@ -400,6 +413,12 @@ func (session *Session) insertStruct(bean any) (int64, error) {
 	res, err := session.exec(sqlStr, args...)
 	if err != nil {
 		return 0, err
+	}
+	if session.statement.InsertIgnore {
+		n, err := res.RowsAffected()
+		if err != nil || n == 0 {
+			return n, err
+		}
 	}
 	applyAutoInsertClosures()
 

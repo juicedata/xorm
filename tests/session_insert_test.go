@@ -1409,3 +1409,148 @@ func TestAutoTimeFields(t *testing.T) {
 	assert.NoError(t, testEngine.Find(&res))
 	assert.EqualValues(t, 2, len(res))
 }
+
+// insertIgnoreRecord exercises generated IDs, composite unique keys, quoted names,
+// binary data and automatically populated timestamps together.
+type insertIgnoreRecord struct {
+	Id      int64     `xorm:"pk autoincr"`
+	Group   int64     `xorm:"unique(ignore_key)"`
+	Name    string    `xorm:"unique(ignore_key) varchar(100)"`
+	Data    []byte    `xorm:"blob"`
+	Created time.Time `xorm:"created"`
+}
+
+func TestInsertIgnore(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	dbType := testEngine.Dialect().URI().DBType
+	if dbType != schemas.MYSQL && dbType != schemas.POSTGRES && dbType != schemas.SQLITE {
+		t.Skip("InsertIgnore does not support this dialect")
+	}
+	version, err := testEngine.DBVersion()
+	assert.NoError(t, err)
+	t.Logf("InsertIgnore database: %s %v", dbType, version)
+	assertSync(t, new(insertIgnoreRecord))
+
+	first := insertIgnoreRecord{Group: 1, Name: "one", Data: []byte{0, 255, 39}}
+	n, err := testEngine.InsertIgnore(&first)
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, n)
+	assert.NotZero(t, first.Id)
+	assert.False(t, first.Created.IsZero())
+
+	duplicate := insertIgnoreRecord{Group: 1, Name: "one", Data: []byte("different")}
+	n, err = testEngine.InsertIgnore(&duplicate)
+	assert.NoError(t, err)
+	assert.Zero(t, n)
+	assert.Zero(t, duplicate.Id)
+	assert.True(t, duplicate.Created.IsZero())
+
+	rows := []insertIgnoreRecord{{Group: 1, Name: "one"}, {Group: 1, Name: "two"}, {Group: 1, Name: "two"}, {Group: 2, Name: "one"}}
+	n, err = testEngine.InsertIgnore(rows)
+	assert.NoError(t, err)
+	assert.EqualValues(t, 2, n)
+	n, err = testEngine.InsertIgnore(&rows)
+	assert.NoError(t, err)
+	assert.Zero(t, n)
+	for _, row := range rows {
+		assert.Zero(t, row.Id, "batch insertion must not assign IDs")
+	}
+
+	pointers := []*insertIgnoreRecord{{Group: 1, Name: "two"}, {Group: 1, Name: "three"}}
+	n, err = testEngine.InsertIgnore(pointers)
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, n)
+	n, err = testEngine.InsertIgnore([]any{&insertIgnoreRecord{Group: 1, Name: "three"}, &insertIgnoreRecord{Group: 1, Name: "four"}})
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, n)
+
+	var got insertIgnoreRecord
+	found, err := testEngine.ID(first.Id).Get(&got)
+	assert.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, first.Data, got.Data)
+	count, err := testEngine.Count(new(insertIgnoreRecord))
+	assert.NoError(t, err)
+	assert.EqualValues(t, 5, count)
+
+	session := testEngine.NewSession()
+	defer session.Close()
+	assert.NoError(t, session.Begin())
+	n, err = session.InsertIgnore(&insertIgnoreRecord{Group: 1, Name: "one"})
+	assert.NoError(t, err)
+	assert.Zero(t, n)
+	n, err = session.Insert(&insertIgnoreRecord{Group: 1, Name: "after-ignore"})
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, n)
+	assert.NoError(t, session.Commit())
+	// Reusing a session must not turn subsequent ordinary inserts into ignores.
+	_, err = session.Insert(&insertIgnoreRecord{Group: 1, Name: "one"})
+	assert.Error(t, err)
+}
+
+func TestInsertIgnoreMaps(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	dbType := testEngine.Dialect().URI().DBType
+	if dbType != schemas.MYSQL && dbType != schemas.POSTGRES && dbType != schemas.SQLITE {
+		t.Skip("InsertIgnore does not support this dialect")
+	}
+	type insertIgnoreMap struct {
+		Id   int64 `xorm:"pk"`
+		Name string
+	}
+	assertSync(t, new(insertIgnoreMap))
+	table := testEngine.TableName(new(insertIgnoreMap), true)
+	n, err := testEngine.Table(table).InsertIgnore(map[string]any{"id": 1, "name": "original"})
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, n)
+	n, err = testEngine.Table(table).InsertIgnore([]map[string]any{{"id": 1, "name": "changed"}, {"id": 2, "name": "second"}, {"id": 2, "name": "changed"}})
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, n)
+	n, err = testEngine.Table(table).InsertIgnore(map[string]string{"id": "1", "name": "changed"})
+	assert.NoError(t, err)
+	assert.Zero(t, n)
+	n, err = testEngine.Table(table).InsertIgnore([]map[string]string{{"id": "2", "name": "changed"}, {"id": "3", "name": "third"}})
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, n)
+	var got insertIgnoreMap
+	found, err := testEngine.ID(1).Get(&got)
+	assert.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, "original", got.Name)
+
+	// A non-duplicate database error must still be returned and reset the session.
+	session := testEngine.NewSession()
+	defer session.Close()
+	_, err = session.Table(table + "_missing").InsertIgnore(map[string]any{"id": 1})
+	assert.Error(t, err)
+	_, err = session.Table(table).Insert(map[string]any{"id": 1})
+	assert.Error(t, err)
+}
+
+type insertIgnoreProcessor struct {
+	Id      int64  `xorm:"pk autoincr"`
+	Name    string `xorm:"unique varchar(100)"`
+	Applied int    `xorm:"-"`
+}
+
+func (r *insertIgnoreProcessor) AfterInsert() { r.Applied++ }
+
+func TestInsertIgnoreProcessors(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	dbType := testEngine.Dialect().URI().DBType
+	if dbType != schemas.MYSQL && dbType != schemas.POSTGRES && dbType != schemas.SQLITE {
+		t.Skip("InsertIgnore does not support this dialect")
+	}
+	assertSync(t, new(insertIgnoreProcessor))
+	first := &insertIgnoreProcessor{Name: "one"}
+	n, err := testEngine.InsertIgnore(first)
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, n)
+	assert.Equal(t, 1, first.Applied)
+	ignored := &insertIgnoreProcessor{Name: "one"}
+	n, err = testEngine.InsertIgnore(ignored)
+	assert.NoError(t, err)
+	assert.Zero(t, n)
+	assert.Zero(t, ignored.Applied)
+	assert.Zero(t, ignored.Id)
+}

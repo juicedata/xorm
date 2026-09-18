@@ -26,6 +26,22 @@ func (statement *Statement) writeInsertOutput(buf *strings.Builder, table *schem
 	return nil
 }
 
+func (statement *Statement) insertClauses() (prefix, suffix string, err error) {
+	if !statement.InsertIgnore {
+		return "INSERT INTO ", "", nil
+	}
+	switch statement.dialect.URI().DBType {
+	case schemas.MYSQL:
+		return "INSERT IGNORE INTO ", "", nil
+	case schemas.SQLITE:
+		return "INSERT OR IGNORE INTO ", "", nil
+	case schemas.POSTGRES:
+		return "INSERT INTO ", " ON CONFLICT DO NOTHING", nil
+	default:
+		return "", "", fmt.Errorf("InsertIgnore is not supported by %s", statement.dialect.URI().DBType)
+	}
+}
+
 // GenInsertSQL generates insert beans SQL
 func (statement *Statement) GenInsertSQL(colNames []string, args []any) (string, []any, error) {
 	var (
@@ -35,7 +51,11 @@ func (statement *Statement) GenInsertSQL(colNames []string, args []any) (string,
 		tableName = statement.TableName()
 	)
 
-	if _, err := buf.WriteString("INSERT INTO "); err != nil {
+	prefix, suffix, err := statement.insertClauses()
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := buf.WriteString(prefix); err != nil {
 		return "", nil, err
 	}
 
@@ -164,6 +184,9 @@ func (statement *Statement) GenInsertSQL(colNames []string, args []any) (string,
 		}
 	}
 
+	if _, err := buf.WriteString(suffix); err != nil {
+		return "", nil, err
+	}
 	if len(table.AutoIncrement) > 0 && statement.dialect.URI().DBType == schemas.POSTGRES {
 		if _, err := buf.WriteString(" RETURNING "); err != nil {
 			return "", nil, err
@@ -184,7 +207,11 @@ func (statement *Statement) GenInsertMapSQL(columns []string, args []any) (strin
 		tableName = statement.TableName()
 	)
 
-	if _, err := fmt.Fprintf(buf, "INSERT INTO %s (", statement.quote(tableName)); err != nil {
+	prefix, suffix, err := statement.insertClauses()
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := fmt.Fprintf(buf, "%s%s (", prefix, statement.quote(tableName)); err != nil {
 		return "", nil, err
 	}
 
@@ -239,6 +266,9 @@ func (statement *Statement) GenInsertMapSQL(columns []string, args []any) (strin
 		}
 	}
 
+	if _, err := buf.WriteString(suffix); err != nil {
+		return "", nil, err
+	}
 	return buf.String(), buf.Args(), nil
 }
 
@@ -249,7 +279,11 @@ func (statement *Statement) GenInsertMultipleMapSQL(columns []string, argss [][]
 		tableName = statement.TableName()
 	)
 
-	if _, err := fmt.Fprintf(buf, "INSERT INTO %s (", statement.quote(tableName)); err != nil {
+	prefix, suffix, err := statement.insertClauses()
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := fmt.Fprintf(buf, "%s%s (", prefix, statement.quote(tableName)); err != nil {
 		return "", nil, err
 	}
 
@@ -291,6 +325,9 @@ func (statement *Statement) GenInsertMultipleMapSQL(columns []string, argss [][]
 		}
 	}
 
+	if _, err := buf.WriteString(suffix); err != nil {
+		return "", nil, err
+	}
 	return buf.String(), buf.Args(), nil
 }
 
@@ -341,14 +378,18 @@ func (statement *Statement) oracleWriteInsertMultiple(w *builder.BytesWriter, ta
 }
 
 func (statement *Statement) WriteInsertMultiple(w *builder.BytesWriter, tableName string, colNames, colMultiPlaces []string) error {
-	if statement.dialect.URI().DBType == schemas.ORACLE {
+	if !statement.InsertIgnore && statement.dialect.URI().DBType == schemas.ORACLE {
 		return statement.oracleWriteInsertMultiple(w, tableName, colNames, colMultiPlaces)
 	}
 	return statement.plainWriteInsertMultiple(w, tableName, colNames, colMultiPlaces)
 }
 
 func (statement *Statement) plainWriteInsertMultiple(w *builder.BytesWriter, tableName string, colNames, colMultiPlaces []string) error {
-	if _, err := fmt.Fprint(w, "INSERT INTO "); err != nil {
+	prefix, suffix, err := statement.insertClauses()
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprint(w, prefix); err != nil {
 		return err
 	}
 	if err := statement.dialect.Quoter().QuoteTo(w.Builder, tableName); err != nil {
@@ -373,5 +414,6 @@ func (statement *Statement) plainWriteInsertMultiple(w *builder.BytesWriter, tab
 			}
 		}
 	}
-	return nil
+	_, err = w.WriteString(suffix)
+	return err
 }
