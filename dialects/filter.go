@@ -46,6 +46,10 @@ func postgresSeqFilterConvertQuestionMark(sql, prefix string, start int) string 
 			buf.WriteByte(c)
 			continue
 		}
+		// Only a "?" right after "::jsonb " is the jsonb operator.
+		if isMaybeJsonbQuestion && c != ' ' && c != '?' {
+			isMaybeJsonbQuestion = false
+		}
 		if !beginSingleQuote && !isLineComment && !isComment && !isMaybeJsonbQuestion && c == '?' {
 			buf.WriteString(fmt.Sprintf("%s%v", prefix, index))
 			index++

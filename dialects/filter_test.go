@@ -101,6 +101,11 @@ func TestSeqFilterPostgresQuestions(t *testing.T) {
 		END;
 		$$ LANGUAGE plpgsql;
 		SELECT * FROM table1 WHERE c = $1`,
+		`SELECT CASE WHEN a THEN 'null'::jsonb ELSE to_jsonb(?) END
+		FROM table1 WHERE c = ?`: `SELECT CASE WHEN a THEN 'null'::jsonb ELSE to_jsonb($1) END
+		FROM table1 WHERE c = $2`,
+		`UPDATE table1 SET d = '{}'::jsonb || ? WHERE c = ?`: `UPDATE table1 SET d = '{}'::jsonb || $1 WHERE c = $2`,
+		`SELECT d::jsonb  ? 'b' FROM table1 WHERE c = ?`:     `SELECT d::jsonb  ? 'b' FROM table1 WHERE c = $1`,
 	}
 	for sql, result := range kases {
 		assert.EqualValues(t, result, postgresSeqFilterConvertQuestionMark(sql, "$", 1))
