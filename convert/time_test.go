@@ -39,3 +39,21 @@ func TestString2Time(t *testing.T) {
 		})
 	}
 }
+
+func TestString2TimeUTCWallClock(t *testing.T) {
+	dbLoc := time.FixedZone("UTC+9", 9*60*60)
+	// A "Z" time is the driver's view of a timestamp without time zone,
+	// with or without a fraction.
+	cases := map[string]time.Time{
+		"2021-08-10T10:33:04Z":     time.Date(2021, 8, 10, 1, 33, 4, 0, time.UTC),
+		"2021-08-10T10:33:04.5Z":   time.Date(2021, 8, 10, 1, 33, 4, 500000000, time.UTC),
+		"2021-08-10T10:33:04.123Z": time.Date(2021, 8, 10, 1, 33, 4, 123000000, time.UTC),
+	}
+	for s, tm := range cases {
+		t.Run(s, func(t *testing.T) {
+			target, err := String2Time(s, dbLoc, time.UTC)
+			assert.NoError(t, err)
+			assert.EqualValues(t, tm, *target)
+		})
+	}
+}

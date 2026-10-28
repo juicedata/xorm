@@ -53,7 +53,15 @@ func String2Time(s string, originalLocation, convertedLocation *time.Location) (
 			strings.HasPrefix(s, "0001-01-01T00:00:00."+strings.Repeat("0", len(s)-20)) {
 			return &time.Time{}, nil
 		}
-		dt, err := time.Parse(time.RFC3339Nano, s)
+		var dt time.Time
+		var err error
+		if s[len(s)-1] == 'Z' {
+			// As without a fraction: drivers return a timestamp without time
+			// zone as UTC, so its wall clock is in originalLocation.
+			dt, err = time.ParseInLocation("2006-01-02T15:04:05.999999999", s[:len(s)-1], originalLocation)
+		} else {
+			dt, err = time.Parse(time.RFC3339Nano, s)
+		}
 		if err != nil {
 			return nil, err
 		}
