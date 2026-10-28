@@ -5,6 +5,7 @@
 package xorm
 
 import (
+	"errors"
 	"reflect"
 
 	"xorm.io/builder"
@@ -16,9 +17,18 @@ import (
 // enumerated all errors
 var (
 	ErrNoColumnsTobeUpdated = statements.ErrNoColumnsTobeUpdated
+	// ErrNeedUpdateCond update needs at least one condition error, only
+	// returned when EngineOptions.RequireUpdateCond is enabled
+	ErrNeedUpdateCond = errors.New("Update action needs at least one condition")
 )
 
 func (session *Session) genAutoCond(condiBean any) (builder.Cond, error) {
+	return session.genAutoCondEx(condiBean, false)
+}
+
+// genAutoCondEx generates conditions from condiBean. If ignoreDeleted is true,
+// the automatic soft delete condition is not included.
+func (session *Session) genAutoCondEx(condiBean any, ignoreDeleted bool) (builder.Cond, error) {
 	if session.statement.NoAutoCondition {
 		return builder.NewCond(), nil
 	}
@@ -29,7 +39,7 @@ func (session *Session) genAutoCond(condiBean any) (builder.Cond, error) {
 			eq[session.engine.Quote(k)] = v
 		}
 
-		if session.statement.RefTable != nil {
+		if session.statement.RefTable != nil && !ignoreDeleted {
 			if col := session.statement.RefTable.DeletedColumn(); col != nil && !session.statement.GetUnscoped() { // tag "deleted" is enabled
 				return eq.And(session.statement.CondDeleted(col)), nil
 			}
@@ -49,6 +59,9 @@ func (session *Session) genAutoCond(condiBean any) (builder.Cond, error) {
 	condTable, err := session.engine.TableInfo(condiBean)
 	if err != nil {
 		return nil, err
+	}
+	if ignoreDeleted {
+		return session.statement.BuildCondsUnscoped(condTable, condiBean, true, true, false, true, false)
 	}
 	return session.statement.BuildConds(condTable, condiBean, true, true, false, true, false)
 }
@@ -156,15 +169,29 @@ func (session *Session) Update(bean any, condiBean ...any) (int64, error) {
 	}
 
 	var autoCond builder.Cond
+	hasUserCond := session.statement.Conds().IsValid()
 	if len(condiBean) > 0 {
 		autoCond, err = session.genAutoCond(condiBean[0])
 		if err != nil {
 			return 0, err
 		}
+		// the auto generated "deleted" condition is not a user condition
+		if session.engine.options.RequireUpdateCond && !hasUserCond {
+			userCond, err := session.genAutoCondEx(condiBean[0], true)
+			if err != nil {
+				return 0, err
+			}
+			hasUserCond = userCond != nil && userCond.IsValid()
+		}
 	} else if table != nil {
 		if col := table.DeletedColumn(); col != nil && !session.statement.GetUnscoped() { // tag "deleted" is enabled
 			autoCond = session.statement.CondDeleted(col)
 		}
+	}
+
+	if session.engine.options.RequireUpdateCond && !hasUserCond &&
+		(session.statement.LimitN == nil || *session.statement.LimitN == 0) {
+		return 0, ErrNeedUpdateCond
 	}
 
 	var (

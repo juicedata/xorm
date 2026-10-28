@@ -616,6 +616,12 @@ func (statement *Statement) BuildConds(table *schemas.Table, bean any, includeVe
 		statement.unscoped, statement.MustColumnMap, statement.TableName(), statement.TableAlias, addedTableName)
 }
 
+// BuildCondsUnscoped is the same as BuildConds but never adds the soft delete condition
+func (statement *Statement) BuildCondsUnscoped(table *schemas.Table, bean any, includeVersion, includeUpdated, includeNil, includeAutoIncr, addedTableName bool) (builder.Cond, error) {
+	return statement.buildConds2(table, bean, includeVersion, includeUpdated, includeNil, includeAutoIncr, statement.allUseBool, statement.useAllCols,
+		true, statement.MustColumnMap, statement.TableName(), statement.TableAlias, addedTableName)
+}
+
 // MergeConds merge conditions from bean and id
 func (statement *Statement) MergeConds(bean any) error {
 	if statement.RefTable != nil {

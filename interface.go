@@ -113,6 +113,8 @@ type EngineInterface interface {
 	SetMapper(names.Mapper)
 	SetMaxOpenConns(int)
 	SetMaxIdleConns(int)
+	SetOptions(...EngineOption)
+	Options() EngineOptions
 	SetQuotePolicy(dialects.QuotePolicy)
 	SetSchema(string)
 	SetTableMapper(names.Mapper)

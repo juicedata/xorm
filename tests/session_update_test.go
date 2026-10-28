@@ -1558,3 +1558,48 @@ func TestUpdateWithJoin(t *testing.T) {
 		Update(&TestUpdateWithJoin{Name: "test2"})
 	assert.NoError(t, err)
 }
+
+type UpdateCondGuard struct {
+	Id      int64
+	Name    string
+	Deleted time.Time `xorm:"deleted"`
+}
+
+func TestUpdateRequireCond(t *testing.T) {
+	assert.NoError(t, PrepareEngine())
+	assertSync(t, new(UpdateCondGuard))
+
+	_, err := testEngine.Insert(&UpdateCondGuard{Name: "a"}, &UpdateCondGuard{Name: "b"})
+	assert.NoError(t, err)
+
+	// disabled by default
+	cnt, err := testEngine.Where("1=1").Update(&UpdateCondGuard{Name: "x"})
+	assert.NoError(t, err)
+	assert.EqualValues(t, 2, cnt)
+
+	testEngine.SetOptions(xorm.WithRequireUpdateCond(true))
+	defer testEngine.SetOptions(xorm.WithRequireUpdateCond(false))
+	assert.True(t, testEngine.Options().RequireUpdateCond)
+
+	_, err = testEngine.Update(&UpdateCondGuard{Name: "y"})
+	assert.ErrorIs(t, err, xorm.ErrNeedUpdateCond)
+
+	// empty condiBean (only the auto "deleted" condition) is not a condition
+	_, err = testEngine.Update(&UpdateCondGuard{Name: "y"}, &UpdateCondGuard{})
+	assert.ErrorIs(t, err, xorm.ErrNeedUpdateCond)
+
+	_, err = testEngine.Update(&UpdateCondGuard{Name: "y"}, map[string]any{})
+	assert.ErrorIs(t, err, xorm.ErrNeedUpdateCond)
+
+	cnt, err = testEngine.Where("name = ?", "x").Update(&UpdateCondGuard{Name: "y"})
+	assert.NoError(t, err)
+	assert.EqualValues(t, 2, cnt)
+
+	cnt, err = testEngine.ID(1).Update(&UpdateCondGuard{Name: "z"})
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, cnt)
+
+	cnt, err = testEngine.Update(&UpdateCondGuard{Name: "w"}, &UpdateCondGuard{Name: "y"})
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, cnt)
+}

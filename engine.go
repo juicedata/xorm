@@ -49,6 +49,8 @@ type Engine struct {
 	logSessionID bool // create session id
 
 	defaultTxOptions *sql.TxOptions
+
+	options EngineOptions
 }
 
 // NewEngine new a db manager according to the parameter. Currently support four
