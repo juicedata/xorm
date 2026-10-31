@@ -572,7 +572,7 @@ func (engine *Engine) dumpTables(ctx context.Context, tables []*schemas.Table, w
 		if table.Type != nil {
 			dstTable, err = dstTableCache.Parse(reflect.New(table.Type).Elem())
 			if err != nil {
-				engine.logger.Errorf("Unable to infer table for %s in new dialect. Error: %v", table.Name)
+				engine.logger.Errorf("Unable to infer table for %s in new dialect. Error: %v", table.Name, err)
 				dstTable = table
 			}
 		}
